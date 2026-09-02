@@ -1,0 +1,38 @@
+# Gradle
+.gradle/
+build/
+
+# Local JDK (workspace runtime, not part of the mod)
+.jdk/
+
+# IDE / Java language server
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+*.launch
+bin/
+out/
+classes/
+
+# Downloaded jars used only for unmanaged IDE classpath
+lib/
+
+# Fabric / Minecraft client run directory
+run/
+
+# OS
+*.DS_Store
+Thumbs.db
+desktop.ini
+
+# JVM crash / profiling dumps
+hs_err_*.log
+replay_*.log
+*.hprof
+*.jfr
+*.class

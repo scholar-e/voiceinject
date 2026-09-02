@@ -1,0 +1,23 @@
+{
+	"schemaVersion": 1,
+	"id": "voiceinject",
+	"version": "${version}",
+	"name": "voiceinject",
+	"description": "Reads microphone input, converts it to text, and sends it into the chatbox.",
+	"authors": [
+		"voiceinject"
+	],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"com.voiceinject.Main"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.3",
+		"minecraft": "~26.2",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}
