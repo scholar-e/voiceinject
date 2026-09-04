@@ -1,9 +1,16 @@
 package com.voiceinject;
 
+import java.io.ByteArrayOutputStream;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.DataLine;
+import javax.sound.sampled.LineUnavailableException;
+import javax.sound.sampled.TargetDataLine;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -97,7 +104,18 @@ public final class Main implements ClientModInitializer {
 
 	/** Captures PCM from the default microphone while a session is active. */
 	public static final class MicrophoneCapture {
+		private static final float[] SAMPLE_RATES = { 16000f, 48000f, 44100f };
+		private static final int SAMPLE_BITS = 16;
+		private static final int CHANNELS = 1;
+		private static final int MAX_SECONDS = 30;
+		private static final int READ_CHUNK = 4096;
+		private static final long JOIN_TIMEOUT_MS = 500L;
+
 		private final AtomicBoolean recording = new AtomicBoolean(false);
+		private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+
+		private volatile Thread captureThread;
+		private volatile TargetDataLine line;
 
 		public boolean isRecording() {
 			return recording.get();
@@ -107,17 +125,134 @@ public final class Main implements ClientModInitializer {
 			if (!recording.compareAndSet(false, true)) {
 				return;
 			}
+			synchronized (buffer) {
+				buffer.reset();
+			}
 			LOGGER.debug("Microphone start");
-			// TODO: open TargetDataLine and buffer 16-bit PCM on a capture thread
+			Thread thread = new Thread(this::captureLoop, "voiceinject-mic");
+			thread.setDaemon(true);
+			captureThread = thread;
+			thread.start();
 		}
 
 		public byte[] stop() {
 			if (!recording.compareAndSet(true, false)) {
 				return new byte[0];
 			}
-			LOGGER.debug("Microphone stop");
-			// TODO: close the line and return the captured samples
-			return new byte[0];
+			closeLine();
+			Thread thread = captureThread;
+			if (thread != null) {
+				try {
+					thread.join(JOIN_TIMEOUT_MS);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
+			captureThread = null;
+			byte[] pcm;
+			synchronized (buffer) {
+				pcm = buffer.toByteArray();
+			}
+			LOGGER.debug("Microphone stop ({} bytes)", pcm.length);
+			return pcm;
+		}
+
+		private void captureLoop() {
+			TargetDataLine opened = null;
+			try {
+				opened = openLine();
+				if (opened == null) {
+					LOGGER.error("No supported microphone line (tried 16/48/44.1 kHz 16-bit mono)");
+					return;
+				}
+				line = opened;
+				opened.start();
+				LOGGER.debug("Microphone line started ({})", opened.getFormat());
+
+				int maxBytes = maxBytesFor(opened.getFormat());
+				byte[] chunk = new byte[READ_CHUNK];
+				while (recording.get()) {
+					int n = opened.read(chunk, 0, chunk.length);
+					if (n <= 0) {
+						break;
+					}
+					synchronized (buffer) {
+						if (buffer.size() >= maxBytes) {
+							break;
+						}
+						int toWrite = Math.min(n, maxBytes - buffer.size());
+						buffer.write(chunk, 0, toWrite);
+					}
+				}
+			} catch (LineUnavailableException e) {
+				LOGGER.error("Microphone unavailable", e);
+			} catch (SecurityException e) {
+				LOGGER.error("Microphone permission denied", e);
+			} catch (RuntimeException e) {
+				LOGGER.error("Microphone capture failed", e);
+			} finally {
+				if (opened != null) {
+					closeQuietly(opened);
+				}
+				if (line == opened) {
+					line = null;
+				}
+			}
+		}
+
+		private static TargetDataLine openLine() throws LineUnavailableException {
+			LineUnavailableException lastUnavailable = null;
+			for (float sampleRate : SAMPLE_RATES) {
+				AudioFormat format = pcmMonoLe(sampleRate);
+				DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
+				if (!AudioSystem.isLineSupported(info)) {
+					continue;
+				}
+				try {
+					TargetDataLine opened = (TargetDataLine) AudioSystem.getLine(info);
+					opened.open(format);
+					LOGGER.debug("Opened microphone at {} Hz", (int) sampleRate);
+					return opened;
+				} catch (LineUnavailableException e) {
+					lastUnavailable = e;
+					LOGGER.debug("Microphone {} Hz unavailable", (int) sampleRate, e);
+				}
+			}
+			if (lastUnavailable != null) {
+				throw lastUnavailable;
+			}
+			return null;
+		}
+
+		private static AudioFormat pcmMonoLe(float sampleRate) {
+			return new AudioFormat(sampleRate, SAMPLE_BITS, CHANNELS, true, false);
+		}
+
+		private static int maxBytesFor(AudioFormat format) {
+			int bytesPerSecond = (int) (format.getSampleRate() * (format.getSampleSizeInBits() / 8) * format.getChannels());
+			return bytesPerSecond * MAX_SECONDS;
+		}
+
+		private void closeLine() {
+			TargetDataLine current = line;
+			if (current != null) {
+				closeQuietly(current);
+			}
+		}
+
+		private static void closeQuietly(TargetDataLine current) {
+			try {
+				current.stop();
+			} catch (RuntimeException ignored) {
+			}
+			try {
+				current.flush();
+			} catch (RuntimeException ignored) {
+			}
+			try {
+				current.close();
+			} catch (RuntimeException ignored) {
+			}
 		}
 	}
 
