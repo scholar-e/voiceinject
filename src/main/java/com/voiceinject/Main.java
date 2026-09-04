@@ -1,10 +1,25 @@
 package com.voiceinject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.util.Comparator;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioSystem;
@@ -14,12 +29,19 @@ import javax.sound.sampled.TargetDataLine;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.vosk.LibVosk;
+import org.vosk.LogLevel;
+import org.vosk.Model;
+import org.vosk.Recognizer;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.InputConstants;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.loader.api.FabricLoader;
 
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
@@ -112,24 +134,31 @@ public final class Main implements ClientModInitializer {
 		private static final long JOIN_TIMEOUT_MS = 500L;
 
 		private final AtomicBoolean recording = new AtomicBoolean(false);
+		private final AtomicInteger session = new AtomicInteger();
 		private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 
 		private volatile Thread captureThread;
 		private volatile TargetDataLine line;
+		private volatile float sampleRate = 16000f;
 
 		public boolean isRecording() {
 			return recording.get();
+		}
+
+		public float sampleRate() {
+			return sampleRate;
 		}
 
 		public void start() {
 			if (!recording.compareAndSet(false, true)) {
 				return;
 			}
+			int id = session.incrementAndGet();
 			synchronized (buffer) {
 				buffer.reset();
 			}
 			LOGGER.debug("Microphone start");
-			Thread thread = new Thread(this::captureLoop, "voiceinject-mic");
+			Thread thread = new Thread(() -> captureLoop(id), "voiceinject-mic");
 			thread.setDaemon(true);
 			captureThread = thread;
 			thread.start();
@@ -139,7 +168,15 @@ public final class Main implements ClientModInitializer {
 			if (!recording.compareAndSet(true, false)) {
 				return new byte[0];
 			}
-			closeLine();
+			TargetDataLine toClose;
+			synchronized (session) {
+				session.incrementAndGet();
+				toClose = line;
+				line = null;
+			}
+			if (toClose != null) {
+				closeQuietly(toClose);
+			}
 			Thread thread = captureThread;
 			if (thread != null) {
 				try {
@@ -157,7 +194,7 @@ public final class Main implements ClientModInitializer {
 			return pcm;
 		}
 
-		private void captureLoop() {
+		private void captureLoop(int id) {
 			TargetDataLine opened = null;
 			try {
 				opened = openLine();
@@ -165,19 +202,22 @@ public final class Main implements ClientModInitializer {
 					LOGGER.error("No supported microphone line (tried 16/48/44.1 kHz 16-bit mono)");
 					return;
 				}
-				line = opened;
+				if (!publishLine(id, opened)) {
+					return;
+				}
+				sampleRate = opened.getFormat().getSampleRate();
 				opened.start();
 				LOGGER.debug("Microphone line started ({})", opened.getFormat());
 
 				int maxBytes = maxBytesFor(opened.getFormat());
 				byte[] chunk = new byte[READ_CHUNK];
-				while (recording.get()) {
+				while (recording.get() && session.get() == id) {
 					int n = opened.read(chunk, 0, chunk.length);
 					if (n <= 0) {
 						break;
 					}
 					synchronized (buffer) {
-						if (buffer.size() >= maxBytes) {
+						if (session.get() != id || buffer.size() >= maxBytes) {
 							break;
 						}
 						int toWrite = Math.min(n, maxBytes - buffer.size());
@@ -194,9 +234,21 @@ public final class Main implements ClientModInitializer {
 				if (opened != null) {
 					closeQuietly(opened);
 				}
-				if (line == opened) {
-					line = null;
+				synchronized (session) {
+					if (line == opened) {
+						line = null;
+					}
 				}
+			}
+		}
+
+		private boolean publishLine(int id, TargetDataLine opened) {
+			synchronized (session) {
+				if (session.get() != id) {
+					return false;
+				}
+				line = opened;
+				return true;
 			}
 		}
 
@@ -233,13 +285,6 @@ public final class Main implements ClientModInitializer {
 			return bytesPerSecond * MAX_SECONDS;
 		}
 
-		private void closeLine() {
-			TargetDataLine current = line;
-			if (current != null) {
-				closeQuietly(current);
-			}
-		}
-
 		private static void closeQuietly(TargetDataLine current) {
 			try {
 				current.stop();
@@ -258,22 +303,190 @@ public final class Main implements ClientModInitializer {
 
 	/** Converts captured audio into chat text. */
 	public static final class SpeechToText {
+		private static final float TARGET_RATE = 16000f;
+		private static final String MODEL_NAME = "vosk-model-small-en-us-0.15";
+		private static final URI MODEL_URL = URI.create("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip");
+
 		private final ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
 			Thread thread = new Thread(runnable, "voiceinject-stt");
 			thread.setDaemon(true);
 			return thread;
 		});
 
-		public CompletableFuture<String> transcribe(byte[] pcm) {
-			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm), executor);
+		private Model model;
+
+		public CompletableFuture<String> transcribe(byte[] pcm, float sampleRate) {
+			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm, sampleRate), executor);
 		}
 
-		private String transcribeBlocking(byte[] pcm) {
+		private String transcribeBlocking(byte[] pcm, float sampleRate) {
 			if (pcm.length == 0) {
 				return "";
 			}
-			// TODO: run Whisper / Vosk / cloud STT against the PCM buffer
-			return "";
+			try {
+				byte[] sixteenKhz = to16kHz(pcm, sampleRate);
+				if (sixteenKhz.length == 0) {
+					return "";
+				}
+				Model loaded = ensureModel();
+				try (Recognizer recognizer = new Recognizer(loaded, TARGET_RATE)) {
+					recognizer.acceptWaveForm(sixteenKhz, sixteenKhz.length);
+					String text = extractText(recognizer.getFinalResult());
+					LOGGER.debug("Vosk result: {}", text);
+					return text;
+				}
+			} catch (Throwable t) {
+				LOGGER.error("Speech-to-text failed", t);
+				return "";
+			}
+		}
+
+		private Model ensureModel() throws IOException, InterruptedException {
+			if (model != null) {
+				return model;
+			}
+			LibVosk.setLogLevel(LogLevel.WARNINGS);
+			Path modelDir = ensureModelOnDisk();
+			LOGGER.info("Loading Vosk model from {}", modelDir);
+			model = new Model(modelDir.toString());
+			return model;
+		}
+
+		private static Path ensureModelOnDisk() throws IOException, InterruptedException {
+			Path modelDir = FabricLoader.getInstance().getConfigDir().resolve("voiceinject").resolve(MODEL_NAME);
+			if (isModelReady(modelDir)) {
+				return modelDir;
+			}
+			if (Files.exists(modelDir)) {
+				deleteRecursively(modelDir);
+			}
+			Path parent = modelDir.getParent();
+			Files.createDirectories(parent);
+			LOGGER.info("Downloading Vosk model from {}", MODEL_URL);
+			Path zip = Files.createTempFile("voiceinject-vosk-", ".zip");
+			try {
+				download(MODEL_URL, zip);
+				unzip(zip, parent);
+			} finally {
+				Files.deleteIfExists(zip);
+			}
+			if (!isModelReady(modelDir)) {
+				throw new IOException("Vosk model missing after extract: " + modelDir);
+			}
+			return modelDir;
+		}
+
+		private static boolean isModelReady(Path modelDir) {
+			return Files.isRegularFile(modelDir.resolve("conf").resolve("model.conf"))
+					|| Files.isRegularFile(modelDir.resolve("am").resolve("final.mdl"));
+		}
+
+		private static void download(URI uri, Path dest) throws IOException, InterruptedException {
+			HttpClient client = HttpClient.newBuilder()
+					.followRedirects(HttpClient.Redirect.NORMAL)
+					.connectTimeout(Duration.ofSeconds(30))
+					.build();
+			HttpRequest request = HttpRequest.newBuilder(uri)
+					.timeout(Duration.ofMinutes(5))
+					.GET()
+					.build();
+			HttpResponse<Path> response = client.send(request, HttpResponse.BodyHandlers.ofFile(dest));
+			int status = response.statusCode();
+			if (status < 200 || status >= 300) {
+				throw new IOException("Download failed: HTTP " + status);
+			}
+		}
+
+		private static void unzip(Path zipFile, Path destDir) throws IOException {
+			Path destAbs = destDir.toAbsolutePath().normalize();
+			try (InputStream in = Files.newInputStream(zipFile); ZipInputStream zis = new ZipInputStream(in)) {
+				ZipEntry entry;
+				while ((entry = zis.getNextEntry()) != null) {
+					Path out = destAbs.resolve(entry.getName()).normalize();
+					if (!out.startsWith(destAbs)) {
+						throw new IOException("Zip entry outside target: " + entry.getName());
+					}
+					if (entry.isDirectory()) {
+						Files.createDirectories(out);
+					} else {
+						Files.createDirectories(out.getParent());
+						Files.copy(zis, out, StandardCopyOption.REPLACE_EXISTING);
+					}
+					zis.closeEntry();
+				}
+			}
+		}
+
+		private static void deleteRecursively(Path root) throws IOException {
+			if (!Files.exists(root)) {
+				return;
+			}
+			try (Stream<Path> walk = Files.walk(root)) {
+				walk.sorted(Comparator.reverseOrder()).forEach(path -> {
+					try {
+						Files.deleteIfExists(path);
+					} catch (IOException e) {
+						throw new RuntimeException(e);
+					}
+				});
+			} catch (RuntimeException e) {
+				if (e.getCause() instanceof IOException io) {
+					throw io;
+				}
+				throw e;
+			}
+		}
+
+		private static byte[] to16kHz(byte[] pcm, float fromRate) {
+			if (pcm.length < 2 || fromRate <= 0f || Math.abs(fromRate - TARGET_RATE) < 1f) {
+				return pcm;
+			}
+			int srcSamples = pcm.length / 2;
+			int dstSamples = Math.max(1, (int) (srcSamples * (TARGET_RATE / fromRate)));
+			byte[] out = new byte[dstSamples * 2];
+			double step = fromRate / TARGET_RATE;
+			for (int i = 0; i < dstSamples; i++) {
+				double srcIndex = i * step;
+				int i0 = Math.min((int) srcIndex, srcSamples - 1);
+				int i1 = Math.min(i0 + 1, srcSamples - 1);
+				double t = srcIndex - i0;
+				int s0 = readLe16(pcm, i0);
+				int s1 = readLe16(pcm, i1);
+				int sample = (int) Math.round(s0 + (s1 - s0) * t);
+				if (sample > Short.MAX_VALUE) {
+					sample = Short.MAX_VALUE;
+				} else if (sample < Short.MIN_VALUE) {
+					sample = Short.MIN_VALUE;
+				}
+				writeLe16(out, i, sample);
+			}
+			return out;
+		}
+
+		private static int readLe16(byte[] pcm, int sampleIndex) {
+			int i = sampleIndex * 2;
+			return (short) ((pcm[i] & 0xff) | (pcm[i + 1] << 8));
+		}
+
+		private static void writeLe16(byte[] out, int sampleIndex, int sample) {
+			int i = sampleIndex * 2;
+			out[i] = (byte) sample;
+			out[i + 1] = (byte) (sample >> 8);
+		}
+
+		private static String extractText(String json) {
+			if (json == null || json.isBlank()) {
+				return "";
+			}
+			JsonElement element = JsonParser.parseString(json);
+			if (!element.isJsonObject()) {
+				return "";
+			}
+			JsonElement text = element.getAsJsonObject().get("text");
+			if (text == null || text.isJsonNull()) {
+				return "";
+			}
+			return text.getAsString().trim();
 		}
 	}
 
@@ -367,9 +580,10 @@ public final class Main implements ClientModInitializer {
 		}
 
 		private void finishSession(Minecraft client) {
+			float rate = microphone.sampleRate();
 			byte[] pcm = microphone.stop();
 			sending = true;
-			speechToText.transcribe(pcm).whenComplete((text, error) -> client.execute(() -> {
+			speechToText.transcribe(pcm, rate).whenComplete((text, error) -> client.execute(() -> {
 				sending = false;
 				if (error != null) {
 					LOGGER.error("Speech-to-text failed", error);
