@@ -20,6 +20,19 @@ dependencies {
 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 	implementation "org.slf4j:slf4j-api:2.0.16"
 	include(implementation("com.alphacephei:vosk:0.3.45"))
+	include(implementation("net.java.dev.jna:jna:5.17.0"))
+}
+
+tasks.register('syncIdeLibs', Copy) {
+	from configurations.compileClasspath
+	include 'vosk-*.jar', 'jna-5*.jar', 'gson-*.jar', 'slf4j-api-*.jar', 'fabric-*.jar'
+	exclude 'jna-platform-*.jar'
+	into 'lib'
+	duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+tasks.named('compileJava') {
+	dependsOn 'syncIdeLibs'
 }
 
 processResources {

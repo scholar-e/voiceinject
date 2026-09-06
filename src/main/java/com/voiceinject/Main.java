@@ -1,3 +1,5 @@
+//TODO: Add an icon when recording is on
+
 package com.voiceinject;
 
 import java.io.ByteArrayOutputStream;
@@ -196,6 +198,7 @@ public final class Main implements ClientModInitializer {
 
 		private void captureLoop(int id) {
 			TargetDataLine opened = null;
+			boolean started = false;
 			try {
 				opened = openLine();
 				if (opened == null) {
@@ -207,6 +210,9 @@ public final class Main implements ClientModInitializer {
 				}
 				sampleRate = opened.getFormat().getSampleRate();
 				opened.start();
+				started = true;
+				//DEBUG
+				debugChat("Microphone activated");
 				LOGGER.debug("Microphone line started ({})", opened.getFormat());
 
 				int maxBytes = maxBytesFor(opened.getFormat());
@@ -233,6 +239,10 @@ public final class Main implements ClientModInitializer {
 			} finally {
 				if (opened != null) {
 					closeQuietly(opened);
+				}
+				if (started) {
+					//DEBUG
+					debugChat("Microphone deactivated");
 				}
 				synchronized (session) {
 					if (line == opened) {
@@ -283,6 +293,15 @@ public final class Main implements ClientModInitializer {
 		private static int maxBytesFor(AudioFormat format) {
 			int bytesPerSecond = (int) (format.getSampleRate() * (format.getSampleSizeInBits() / 8) * format.getChannels());
 			return bytesPerSecond * MAX_SECONDS;
+		}
+
+		private static void debugChat(String message) {
+			Minecraft client = Minecraft.getInstance();
+			client.execute(() -> {
+				if (client.player != null) {
+					client.player.sendSystemMessage(Component.literal(message));
+				}
+			});
 		}
 
 		private static void closeQuietly(TargetDataLine current) {
