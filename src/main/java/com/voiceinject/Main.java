@@ -14,6 +14,8 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.Comparator;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -82,7 +84,7 @@ public final class Main implements ClientModInitializer {
 	public enum RecordingMode {
 		/** Hold to record, release to transcribe and send. */
 		HOLD,
-		/** Tap to start recording, tap again to transcribe and send. */
+		/** Tap to record, tap to preview, then tap to send the selected alternative. */
 		TAP
 	}
 
@@ -103,6 +105,7 @@ public final class Main implements ClientModInitializer {
 		public static KeyMapping.Category category;
 		public static KeyMapping record;
 		public static KeyMapping cycleMode;
+		public static KeyMapping cycleAlternative;
 
 		private Keybinds() {
 		}
@@ -114,6 +117,13 @@ public final class Main implements ClientModInitializer {
 					"key.voiceinject.record",
 					InputConstants.Type.KEYSYM,
 					InputConstants.KEY_V,
+					category
+			));
+
+			cycleAlternative = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+					"key.voiceinject.cycle_alternative",
+					InputConstants.Type.KEYSYM,
+					InputConstants.KEY_B,
 					category
 			));
 
@@ -334,29 +344,30 @@ public final class Main implements ClientModInitializer {
 
 		private Model model;
 
-		public CompletableFuture<String> transcribe(byte[] pcm, float sampleRate) {
+		public CompletableFuture<List<String>> transcribe(byte[] pcm, float sampleRate) {
 			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm, sampleRate), executor);
 		}
 
-		private String transcribeBlocking(byte[] pcm, float sampleRate) {
+		private List<String> transcribeBlocking(byte[] pcm, float sampleRate) {
 			if (pcm.length == 0) {
-				return "";
+				return List.of();
 			}
 			try {
 				byte[] sixteenKhz = to16kHz(pcm, sampleRate);
 				if (sixteenKhz.length == 0) {
-					return "";
+					return List.of();
 				}
 				Model loaded = ensureModel();
 				try (Recognizer recognizer = new Recognizer(loaded, TARGET_RATE)) {
+					recognizer.setMaxAlternatives(10);
 					recognizer.acceptWaveForm(sixteenKhz, sixteenKhz.length);
-					String text = extractText(recognizer.getFinalResult());
+					List<String> text = extractAlternatives(recognizer.getFinalResult());
 					LOGGER.debug("Vosk result: {}", text);
 					return text;
 				}
 			} catch (Throwable t) {
 				LOGGER.error("Speech-to-text failed", t);
-				return "";
+				return List.of();
 			}
 		}
 
@@ -493,20 +504,29 @@ public final class Main implements ClientModInitializer {
 			out[i + 1] = (byte) (sample >> 8);
 		}
 
-		private static String extractText(String json) {
-			if (json == null || json.isBlank()) {
-				return "";
-			}
+		static List<String> extractAlternatives(String json) {
+			List<String> options = new ArrayList<>();
+			if (json == null || json.isBlank()) return options;
 			JsonElement element = JsonParser.parseString(json);
-			if (!element.isJsonObject()) {
-				return "";
+			if (!element.isJsonObject()) return options;
+			JsonElement alternatives = element.getAsJsonObject().get("alternatives");
+			if (alternatives != null && alternatives.isJsonArray()) {
+				for (JsonElement alternative : alternatives.getAsJsonArray()) {
+					addAlternative(options, alternative);
+				}
 			}
-			JsonElement text = element.getAsJsonObject().get("text");
-			if (text == null || text.isJsonNull()) {
-				return "";
-			}
-			return text.getAsString().trim();
+			if (options.isEmpty()) addAlternative(options, element);
+			return List.copyOf(options);
 		}
+
+		private static void addAlternative(List<String> options, JsonElement element) {
+			if (!element.isJsonObject()) return;
+			JsonElement text = element.getAsJsonObject().get("text");
+			if (text == null || !text.isJsonPrimitive() || !text.getAsJsonPrimitive().isString()) return;
+			String value = text.getAsString().trim();
+			if (!value.isEmpty() && !options.contains(value)) options.add(value);
+		}
+
 	}
 
 	/** Sends recognized text as the local player. */
@@ -543,6 +563,10 @@ public final class Main implements ClientModInitializer {
 
 		private boolean holdWasDown;
 		private boolean sending;
+		private List<String> pending = List.of();
+		private int selected;
+		private int session;
+		private Object connection;
 
 		public VoiceController(Config config, MicrophoneCapture microphone, SpeechToText speechToText, ChatInjector chat) {
 			this.config = config;
@@ -552,13 +576,25 @@ public final class Main implements ClientModInitializer {
 		}
 
 		public void tick(Minecraft client) {
-			if (client.player == null || sending) {
+			if (client.player == null || connection != client.player.connection) {
+				connection = client.player == null ? null : client.player.connection;
+				session++;
+				sending = false;
+				pending = List.of();
+				holdWasDown = false;
+				if (microphone.isRecording()) microphone.stop();
+				drainClicks();
+				return;
+			}
+			if (sending) {
 				drainClicks();
 				return;
 			}
 
 			while (Keybinds.cycleMode.consumeClick()) {
 				config.cycleMode();
+				pending = List.of();
+				client.gui.hud.setOverlayMessage(Component.empty(), false);
 				if (microphone.isRecording()) {
 					microphone.stop();
 				}
@@ -567,6 +603,13 @@ public final class Main implements ClientModInitializer {
 						Component.literal("voiceinject mode: " + config.mode.name().toLowerCase())
 				);
 			}
+
+			while (Keybinds.cycleAlternative.consumeClick()) {
+				if (!pending.isEmpty() && client.gui.screen() == null) {
+					selected = (selected + 1) % pending.size();
+				}
+			}
+			if (!pending.isEmpty()) showPreview(client);
 
 			if (config.mode == RecordingMode.HOLD) {
 				tickHold(client);
@@ -590,29 +633,59 @@ public final class Main implements ClientModInitializer {
 				if (client.gui.screen() != null) {
 					continue;
 				}
-				if (microphone.isRecording()) {
+				if (!pending.isEmpty()) {
+					chat.send(client, pending.get(selected));
+					pending = List.of();
+					client.gui.hud.setOverlayMessage(Component.empty(), false);
+					drainClicks();
+					return;
+				} else if (microphone.isRecording()) {
 					finishSession(client);
+					drainClicks();
+					return;
 				} else {
 					microphone.start();
 				}
 			}
 		}
 
+		private void showPreview(Minecraft client) {
+			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.preview",
+					selected + 1, pending.size(), pending.get(selected),
+					Keybinds.cycleAlternative.getTranslatedKeyMessage(),
+					Keybinds.record.getTranslatedKeyMessage()), false);
+		}
+
 		private void finishSession(Minecraft client) {
 			float rate = microphone.sampleRate();
 			byte[] pcm = microphone.stop();
 			sending = true;
+			int requestSession = session;
+			boolean preview = config.mode == RecordingMode.TAP;
+			if (preview) client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
 			speechToText.transcribe(pcm, rate).whenComplete((text, error) -> client.execute(() -> {
+				if (requestSession != session || client.player == null || client.player.connection != connection) return;
+				drainClicks();
 				sending = false;
 				if (error != null) {
 					LOGGER.error("Speech-to-text failed", error);
 					return;
 				}
-				chat.send(client, text);
+				if (text.isEmpty()) {
+					client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.no_speech"), false);
+				} else if (preview) {
+					pending = text;
+					selected = 0;
+					showPreview(client);
+				} else {
+					chat.send(client, text.get(0));
+				}
 			}));
 		}
 
 		private static void drainClicks() {
+			while (Keybinds.cycleAlternative.consumeClick()) {
+			}
 			while (Keybinds.record.consumeClick()) {
 				// drop buffered presses while a send is in flight or the player is missing
 			}

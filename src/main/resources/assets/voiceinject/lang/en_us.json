@@ -1,5 +1,9 @@
 {
 	"key.category.voiceinject.voice": "voiceinject",
 	"key.voiceinject.record": "Voice record",
-	"key.voiceinject.cycle_mode": "Cycle hold/tap mode"
+	"key.voiceinject.cycle_mode": "Cycle hold/tap mode",
+	"key.voiceinject.cycle_alternative": "Cycle voice prediction",
+	"voiceinject.preview": "Voice [%s/%s]: %s | %s: next | %s: send",
+	"voiceinject.transcribing": "Recognizing speech…",
+	"voiceinject.no_speech": "No speech recognized. Record again."
 }
