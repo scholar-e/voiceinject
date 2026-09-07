@@ -1,4 +1,9 @@
 //TODO: Add an icon when recording is on
+//TODO: Add a config screen. Replace the "toggle mode" keybind
+// with a keybind for the config screen instead and put it there
+//TODO: Fix the recording cutting off a bit from start and end
+//TODO: Delete the small model and use the large model
+//TODO: Add an option to delete message at the end of the list of options
 
 package com.voiceinject;
 
