@@ -85,3 +85,12 @@ tasks.register('recordingBufferTest', JavaExec) {
 tasks.named('check') {
 	dependsOn 'recordingBufferTest'
 }
+
+tasks.register('hotCommandsTest', JavaExec) {
+	dependsOn recordingChecksClasses
+	classpath = sourceSets.recordingChecks.runtimeClasspath
+	mainClass = 'com.voiceinject.HotCommandsTest'
+}
+tasks.named('check') {
+	dependsOn 'hotCommandsTest'
+}

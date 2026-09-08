@@ -36,6 +36,9 @@ import org.vosk.Model;
 import org.vosk.Recognizer;
 
 import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonArray;
+import com.google.gson.GsonBuilder;
 import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.InputConstants;
 
@@ -47,6 +50,7 @@ import net.fabricmc.loader.api.FabricLoader;
 
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.minecraft.client.KeyMapping;
@@ -108,6 +112,7 @@ public final class Main implements ClientModInitializer {
 	/** Settings saved in the instance config directory. */
 	public static final class Config {
 		public RecordingMode mode = RecordingMode.HOLD;
+		public List<String> hotCommands = List.of();
 		private static Path path() {
 			return FabricLoader.getInstance().getConfigDir().resolve("voiceinject.json");
 		}
@@ -115,8 +120,17 @@ public final class Main implements ClientModInitializer {
 			Config result = new Config();
 			if (Files.exists(path())) {
 				try {
-					result.mode = RecordingMode.valueOf(JsonParser.parseString(Files.readString(path()))
-							.getAsJsonObject().get("mode").getAsString());
+					JsonObject saved = JsonParser.parseString(Files.readString(path())).getAsJsonObject();
+					if (saved.has("mode")) result.mode = RecordingMode.valueOf(saved.get("mode").getAsString());
+					List<String> commands = new ArrayList<>();
+					if (saved.has("hotCommands") && saved.get("hotCommands").isJsonArray()) {
+						for (JsonElement entry : saved.getAsJsonArray("hotCommands")) {
+							if (!entry.isJsonPrimitive() || !entry.getAsJsonPrimitive().isString()) continue;
+							String value = entry.getAsString().trim();
+							if (!value.isEmpty() && HotCommands.valid(value) && commands.size() < HotCommands.LIMIT) commands.add(value);
+						}
+					}
+					result.hotCommands = List.copyOf(commands);
 				} catch (Exception e) { LOGGER.warn("Could not load voice settings; using hold mode", e); }
 			}
 			return result;
@@ -126,7 +140,12 @@ public final class Main implements ClientModInitializer {
 				Files.createDirectories(path().getParent());
 				Path temporary = Files.createTempFile(path().getParent(), "voiceinject-settings", ".tmp");
 				try {
-					Files.writeString(temporary, "{\n  \"mode\": \"" + mode.name() + "\"\n}\n");
+					JsonObject saved = new JsonObject();
+					saved.addProperty("mode", mode.name());
+					JsonArray commands = new JsonArray();
+					hotCommands.forEach(commands::add);
+					saved.add("hotCommands", commands);
+					Files.writeString(temporary, new GsonBuilder().setPrettyPrinting().create().toJson(saved) + "\n");
 					Files.move(temporary, path(), StandardCopyOption.REPLACE_EXISTING);
 				} finally { Files.deleteIfExists(temporary); }
 				return true;
@@ -152,6 +171,9 @@ public final class Main implements ClientModInitializer {
 				saveFailed = !settings.save();
 				button.setMessage(modeLabel());
 			}).bounds(width / 2 - 100, height / 2 - 24, 200, 20).build());
+			addRenderableWidget(Button.builder(Component.translatable("voiceinject.hot.title"), button ->
+					minecraft.gui.setScreen(new HotCommandScreen(this, settings)))
+					.bounds(width / 2 - 100, height / 2 + 28, 200, 20).build());
 			addRenderableWidget(Button.builder(Component.translatable("gui.done"), button -> onClose())
 					.bounds(width / 2 - 100, height / 2 + 50, 200, 20).build());
 		}
@@ -159,7 +181,55 @@ public final class Main implements ClientModInitializer {
 			super.extractRenderState(graphics, mouseX, mouseY, partialTick);
 			graphics.centeredText(font, title, width / 2, height / 2 - 60, 0xFFFFFFFF);
 			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 8, 0xFFCCCCCC);
-			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 30, 0xFFFF5555);
+			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 76, 0xFFFF5555);
+		}
+		@Override public void onClose() { minecraft.gui.setScreen(parent); }
+		@Override public boolean isPauseScreen() { return false; }
+	}
+
+	public static final class HotCommandScreen extends Screen {
+		private final Screen parent;
+		private final Config settings;
+		private final List<String> drafts = new ArrayList<>();
+		private Component error = Component.empty();
+		HotCommandScreen(Screen parent, Config settings) {
+			super(Component.translatable("voiceinject.hot.title"));
+			this.parent = parent;
+			this.settings = settings;
+			for (int i = 0; i < HotCommands.LIMIT; i++) drafts.add(i < settings.hotCommands.size() ? settings.hotCommands.get(i) : "");
+		}
+		@Override protected void init() {
+			int fieldWidth = Math.min(360, width - 32);
+			int top = Math.max(40, height / 2 - 62);
+			for (int i = 0; i < HotCommands.LIMIT; i++) {
+				final int slot = i;
+				EditBox field = new EditBox(font, (width - fieldWidth) / 2, top + i * 24, fieldWidth, 20,
+						Component.translatable("voiceinject.hot.slot", i + 1));
+				field.setMaxLength(256);
+				field.setValue(drafts.get(i));
+				field.setHint(Component.literal("/msg PlayerName {text}"));
+				field.setResponder(value -> drafts.set(slot, value));
+				addRenderableWidget(field);
+			}
+			addRenderableWidget(Button.builder(Component.translatable("voiceinject.hot.save"), button -> {
+				List<String> values = drafts.stream().map(String::trim).filter(value -> !value.isEmpty()).toList();
+				if (values.stream().anyMatch(value -> !HotCommands.valid(value))) {
+					error = Component.translatable("voiceinject.hot.invalid");
+					return;
+				}
+				List<String> previous = settings.hotCommands;
+				settings.hotCommands = values;
+				if (settings.save()) onClose();
+				else { settings.hotCommands = previous; error = Component.translatable("voiceinject.settings.save_failed"); }
+			}).bounds(width / 2 - 104, top + 124, 100, 20).build());
+			addRenderableWidget(Button.builder(Component.translatable("gui.cancel"), button -> onClose())
+					.bounds(width / 2 + 4, top + 124, 100, 20).build());
+		}
+		@Override public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
+			super.extractRenderState(graphics, mouseX, mouseY, partialTick);
+			graphics.centeredText(font, title, width / 2, 8, 0xFFFFFFFF);
+			graphics.centeredText(font, Component.translatable("voiceinject.hot.help"), width / 2, 24, 0xFFCCCCCC);
+			graphics.centeredText(font, error, width / 2, Math.max(40, height / 2 - 62) + 148, 0xFFFF5555);
 		}
 		@Override public void onClose() { minecraft.gui.setScreen(parent); }
 		@Override public boolean isPauseScreen() { return false; }
@@ -170,12 +240,18 @@ public final class Main implements ClientModInitializer {
 		public static KeyMapping record;
 		public static KeyMapping openConfig;
 		public static KeyMapping cycleAlternative;
+		public static KeyMapping cycleHotCommand;
+		public static KeyMapping sendHotCommand;
 
 		private Keybinds() {
 		}
 
 		public static void register() {
 			category = KeyMapping.Category.register(Identifier.fromNamespaceAndPath(MOD_ID, "voice"));
+			cycleHotCommand = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.voiceinject.cycle_hot_command",
+					InputConstants.Type.KEYSYM, InputConstants.KEY_C, category));
+			sendHotCommand = KeyMappingHelper.registerKeyMapping(new KeyMapping("key.voiceinject.send_hot_command",
+					InputConstants.Type.KEYSYM, InputConstants.KEY_H, category));
 
 			record = KeyMappingHelper.registerKeyMapping(new KeyMapping(
 					"key.voiceinject.record",
@@ -513,21 +589,26 @@ public final class Main implements ClientModInitializer {
 
 	/** Sends recognized text as the local player. */
 	public static final class ChatInjector {
-		public void send(Minecraft client, String text) {
+		public boolean send(Minecraft client, String text) {
 			if (client.player == null) {
-				return;
+				return false;
 			}
 
 			String message = text == null ? "" : text.trim();
 			if (message.isEmpty()) {
-				return;
+				return false;
 			}
 
+			if (message.length() > 256) {
+				client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.hot.too_long"), false);
+				return false;
+			}
 			if (message.startsWith("/")) {
 				client.player.connection.sendCommand(message.substring(1));
 			} else {
 				client.player.connection.sendChat(message);
 			}
+			return true;
 		}
 	}
 
@@ -547,6 +628,7 @@ public final class Main implements ClientModInitializer {
 		private boolean sending;
 		private List<String> pending = List.of();
 		private int selected;
+		private int hotCommand = -1;
 		private int session;
 		private Object connection;
 
@@ -563,6 +645,7 @@ public final class Main implements ClientModInitializer {
 				session++;
 				sending = false;
 				pending = List.of();
+				hotCommand = -1;
 				holdWasDown = false;
 				microphone.close();
 				if (client.player != null) microphone.warmUp();
@@ -574,6 +657,7 @@ public final class Main implements ClientModInitializer {
 					session++;
 					sending = false;
 					pending = List.of();
+					hotCommand = -1;
 					microphone.discard();
 					holdWasDown = false;
 					client.gui.hud.setOverlayMessage(Component.empty(), false);
@@ -584,6 +668,24 @@ public final class Main implements ClientModInitializer {
 			}
 			if (sending) { drainClicks(); return; }
 			if (microphone.hasCompletedRecording()) { finishSession(client); return; }
+			while (Keybinds.cycleHotCommand.consumeClick()) {
+				if (client.gui.screen() == null) {
+					hotCommand = HotCommands.next(hotCommand, config.hotCommands);
+					client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.hot.selected",
+							hotCommand < 0 ? Component.translatable("voiceinject.hot.normal") : Component.literal(selectedCommand())), false);
+				}
+			}
+			while (Keybinds.sendHotCommand.consumeClick()) {
+				if (client.gui.screen() == null && !microphone.isRecording() && pending.isEmpty() && hotCommand >= 0) {
+					if (selectedCommand().contains("{text}")) {
+						client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.hot.record"), false);
+					} else {
+						if (chat.send(client, selectedCommand())) client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.hot.sent"), false);
+					}
+					while (Keybinds.sendHotCommand.consumeClick()) {}
+					break;
+				}
+			}
 
 			while (Keybinds.cycleAlternative.consumeClick()) {
 				if (!pending.isEmpty() && client.gui.screen() == null) {
@@ -597,6 +699,10 @@ public final class Main implements ClientModInitializer {
 			} else {
 				tickTap(client);
 			}
+		}
+
+		private String selectedCommand() {
+			return hotCommand >= 0 && hotCommand < config.hotCommands.size() ? config.hotCommands.get(hotCommand) : "";
 		}
 
 		private void startRecording(Minecraft client) {
@@ -622,7 +728,10 @@ public final class Main implements ClientModInitializer {
 					continue;
 				}
 				if (!pending.isEmpty()) {
-					if (selected < pending.size()) chat.send(client, pending.get(selected));
+					if (selected < pending.size() && !chat.send(client, HotCommands.forSpeech(selectedCommand(), pending.get(selected)))) {
+						drainClicks();
+						return;
+					}
 					pending = List.of();
 					client.gui.hud.setOverlayMessage(Component.empty(), false);
 					drainClicks();
@@ -638,9 +747,13 @@ public final class Main implements ClientModInitializer {
 		}
 
 		private void showPreview(Minecraft client) {
+			if (selected < pending.size() && HotCommands.forSpeech(selectedCommand(), pending.get(selected)).length() > 256) {
+				client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.hot.preview_too_long"), false);
+				return;
+			}
 			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.preview",
 					selected + 1, pending.size() + 1,
-					selected == pending.size() ? Component.translatable("voiceinject.discard") : Component.literal(pending.get(selected)),
+					selected == pending.size() ? Component.translatable("voiceinject.discard") : Component.literal(HotCommands.forSpeech(selectedCommand(), pending.get(selected))),
 					Keybinds.cycleAlternative.getTranslatedKeyMessage(),
 					Keybinds.record.getTranslatedKeyMessage()), false);
 		}
@@ -650,6 +763,7 @@ public final class Main implements ClientModInitializer {
 			sending = true;
 			int requestSession = session;
 			boolean preview = config.mode == RecordingMode.TAP;
+			String command = selectedCommand();
 			if (preview) client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
 			captured.thenCompose(clip -> speechToText.transcribe(clip.pcm(), clip.sampleRate())).whenComplete((text, error) -> client.execute(() -> {
 				if (requestSession != session || client.player == null || client.player.connection != connection) return;
@@ -668,12 +782,14 @@ public final class Main implements ClientModInitializer {
 					selected = 0;
 					showPreview(client);
 				} else {
-					chat.send(client, text.get(0));
+					chat.send(client, HotCommands.forSpeech(command, text.get(0)));
 				}
 			}));
 		}
 
 		private static void drainClicks() {
+			while (Keybinds.cycleHotCommand.consumeClick()) {}
+			while (Keybinds.sendHotCommand.consumeClick()) {}
 			while (Keybinds.cycleAlternative.consumeClick()) {
 			}
 			while (Keybinds.record.consumeClick()) {

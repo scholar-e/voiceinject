@@ -15,5 +15,18 @@
 	"voiceinject.recording": "Recording",
 	"voiceinject.discard": "Discard message",
 	"voiceinject.mic_not_ready": "Microphone not ready. Try recording again in a moment.",
-	"voiceinject.failed": "Voice recognition failed. Check the game log."
+	"voiceinject.failed": "Voice recognition failed. Check the game log.",
+	"key.voiceinject.cycle_hot_command": "Cycle hot command / normal chat",
+	"key.voiceinject.send_hot_command": "Send selected hot command",
+	"voiceinject.hot.title": "Hot commands",
+	"voiceinject.hot.slot": "Hot command %s",
+	"voiceinject.hot.help": "Use /msg Player {text} for speech. Blank slots are ignored.",
+	"voiceinject.hot.save": "Save",
+	"voiceinject.hot.invalid": "Commands must start with / and contain no control characters.",
+	"voiceinject.hot.selected": "Hot command: %s",
+	"voiceinject.hot.normal": "Normal chat",
+	"voiceinject.hot.record": "Record speech to fill {text}.",
+	"voiceinject.hot.sent": "Hot command sent.",
+	"voiceinject.hot.too_long": "Message exceeds 256 characters. Shorten it and try again.",
+	"voiceinject.hot.preview_too_long": "Message too long. Cycle to another prediction, command, or Discard."
 }
