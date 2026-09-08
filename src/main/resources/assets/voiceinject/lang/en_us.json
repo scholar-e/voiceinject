@@ -1,9 +1,19 @@
 {
 	"key.category.voiceinject.voice": "voiceinject",
 	"key.voiceinject.record": "Voice record",
-	"key.voiceinject.cycle_mode": "Cycle hold/tap mode",
 	"key.voiceinject.cycle_alternative": "Cycle voice prediction",
-	"voiceinject.preview": "Voice [%s/%s]: %s | %s: next | %s: send",
+	"voiceinject.preview": "Voice [%s/%s]: %s | %s: next | %s: confirm",
 	"voiceinject.transcribing": "Recognizing speech…",
-	"voiceinject.no_speech": "No speech recognized. Record again."
+	"voiceinject.no_speech": "No speech recognized. Record again.",
+	"key.voiceinject.open_config": "VoiceInject settings",
+	"voiceinject.settings": "VoiceInject settings",
+	"voiceinject.mode": "Recording mode: %s",
+	"voiceinject.mode.hold": "Hold",
+	"voiceinject.mode.tap": "Tap",
+	"voiceinject.settings.help": "Hold: release to send. Tap: stop, review, confirm.",
+	"voiceinject.settings.save_failed": "Could not save settings. Check the game log.",
+	"voiceinject.recording": "Recording",
+	"voiceinject.discard": "Discard message",
+	"voiceinject.mic_not_ready": "Microphone not ready. Try recording again in a moment.",
+	"voiceinject.failed": "Voice recognition failed. Check the game log."
 }

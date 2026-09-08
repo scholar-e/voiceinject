@@ -68,3 +68,20 @@ publishing {
 	repositories {
 	}
 }
+
+// Dependency-free regression checks for audio boundaries and bounded buffering.
+sourceSets {
+	recordingChecks {
+		java.srcDir 'src/check/java'
+		compileClasspath = sourceSets.main.output
+		runtimeClasspath = output + compileClasspath
+	}
+}
+tasks.register('recordingBufferTest', JavaExec) {
+	dependsOn recordingChecksClasses
+	classpath = sourceSets.recordingChecks.runtimeClasspath
+	mainClass = 'com.voiceinject.RecordingBufferTest'
+}
+tasks.named('check') {
+	dependsOn 'recordingBufferTest'
+}

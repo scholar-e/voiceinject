@@ -1,13 +1,5 @@
-//TODO: Add an icon when recording is on
-//TODO: Add a config screen. Replace the "toggle mode" keybind
-// with a keybind for the config screen instead and put it there
-//TODO: Fix the recording cutting off a bit from start and end
-//TODO: Delete the small model and use the large model
-//TODO: Add an option to delete message at the end of the list of options
-
 package com.voiceinject;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -24,8 +16,8 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
+
+
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -49,9 +41,14 @@ import com.mojang.blaze3d.platform.InputConstants;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.loader.api.FabricLoader;
 
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.GuiGraphicsExtractor;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
@@ -83,6 +80,21 @@ public final class Main implements ClientModInitializer {
 		);
 
 		ClientTickEvents.END_CLIENT_TICK.register(controller::tick);
+		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> controller.microphone.close());
+		HudElementRegistry.addLast(Identifier.fromNamespaceAndPath(MOD_ID, "recording"), (graphics, delta) -> {
+			Minecraft client = Minecraft.getInstance();
+			if (client.player != null && controller.microphone.isRecording() && !client.gui.hud.isHidden()) {
+				// A small microphone silhouette, drawn without a texture dependency.
+				graphics.fill(8, 8, 20, 26, 0xAA000000);
+				graphics.fill(12, 10, 16, 18, 0xFFFF4545);
+				graphics.fill(10, 15, 11, 20, 0xFFFFFFFF);
+				graphics.fill(17, 15, 18, 20, 0xFFFFFFFF);
+				graphics.fill(11, 20, 17, 21, 0xFFFFFFFF);
+				graphics.fill(13, 21, 15, 24, 0xFFFFFFFF);
+				graphics.fill(11, 24, 17, 25, 0xFFFFFFFF);
+				graphics.text(client.font, Component.translatable("voiceinject.recording"), 24, 13, 0xFFFFFFFF);
+			}
+		});
 		LOGGER.info("Initialized (mode={})", config.mode);
 	}
 
@@ -93,23 +105,70 @@ public final class Main implements ClientModInitializer {
 		TAP
 	}
 
-	/** In-memory settings. Persistence / options screen can replace this later. */
+	/** Settings saved in the instance config directory. */
 	public static final class Config {
 		public RecordingMode mode = RecordingMode.HOLD;
-
+		private static Path path() {
+			return FabricLoader.getInstance().getConfigDir().resolve("voiceinject.json");
+		}
 		public static Config load() {
-			return new Config();
+			Config result = new Config();
+			if (Files.exists(path())) {
+				try {
+					result.mode = RecordingMode.valueOf(JsonParser.parseString(Files.readString(path()))
+							.getAsJsonObject().get("mode").getAsString());
+				} catch (Exception e) { LOGGER.warn("Could not load voice settings; using hold mode", e); }
+			}
+			return result;
 		}
+		public boolean save() {
+			try {
+				Files.createDirectories(path().getParent());
+				Path temporary = Files.createTempFile(path().getParent(), "voiceinject-settings", ".tmp");
+				try {
+					Files.writeString(temporary, "{\n  \"mode\": \"" + mode.name() + "\"\n}\n");
+					Files.move(temporary, path(), StandardCopyOption.REPLACE_EXISTING);
+				} finally { Files.deleteIfExists(temporary); }
+				return true;
+			} catch (IOException e) { LOGGER.error("Could not save voice settings", e); return false; }
+		}
+	}
 
-		public void cycleMode() {
-			mode = (mode == RecordingMode.HOLD) ? RecordingMode.TAP : RecordingMode.HOLD;
+	public static final class ConfigScreen extends Screen {
+		private final Screen parent;
+		private final Config settings;
+		private boolean saveFailed;
+		ConfigScreen(Screen parent, Config settings) {
+			super(Component.translatable("voiceinject.settings"));
+			this.parent = parent;
+			this.settings = settings;
 		}
+		private Component modeLabel() {
+			return Component.translatable("voiceinject.mode", Component.translatable("voiceinject.mode." + settings.mode.name().toLowerCase(java.util.Locale.ROOT)));
+		}
+		@Override protected void init() {
+			addRenderableWidget(Button.builder(modeLabel(), button -> {
+				settings.mode = settings.mode == RecordingMode.HOLD ? RecordingMode.TAP : RecordingMode.HOLD;
+				saveFailed = !settings.save();
+				button.setMessage(modeLabel());
+			}).bounds(width / 2 - 100, height / 2 - 24, 200, 20).build());
+			addRenderableWidget(Button.builder(Component.translatable("gui.done"), button -> onClose())
+					.bounds(width / 2 - 100, height / 2 + 50, 200, 20).build());
+		}
+		@Override public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
+			super.extractRenderState(graphics, mouseX, mouseY, partialTick);
+			graphics.centeredText(font, title, width / 2, height / 2 - 60, 0xFFFFFFFF);
+			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 8, 0xFFCCCCCC);
+			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 30, 0xFFFF5555);
+		}
+		@Override public void onClose() { minecraft.gui.setScreen(parent); }
+		@Override public boolean isPauseScreen() { return false; }
 	}
 
 	public static final class Keybinds {
 		public static KeyMapping.Category category;
 		public static KeyMapping record;
-		public static KeyMapping cycleMode;
+		public static KeyMapping openConfig;
 		public static KeyMapping cycleAlternative;
 
 		private Keybinds() {
@@ -132,214 +191,134 @@ public final class Main implements ClientModInitializer {
 					category
 			));
 
-			cycleMode = KeyMappingHelper.registerKeyMapping(new KeyMapping(
-					"key.voiceinject.cycle_mode",
+			openConfig = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+					"key.voiceinject.open_config",
 					InputConstants.Type.KEYSYM,
-					InputConstants.UNKNOWN.getValue(),
+					InputConstants.KEY_O,
 					category
 			));
 		}
 	}
 
-	/** Captures PCM from the default microphone while a session is active. */
+	/** Keeps 250 ms of local pre-roll and completes recordings after a 200 ms tail. */
 	public static final class MicrophoneCapture {
-		private static final float[] SAMPLE_RATES = { 16000f, 48000f, 44100f };
-		private static final int SAMPLE_BITS = 16;
-		private static final int CHANNELS = 1;
-		private static final int MAX_SECONDS = 30;
-		private static final int READ_CHUNK = 4096;
-		private static final long JOIN_TIMEOUT_MS = 500L;
-
-		private final AtomicBoolean recording = new AtomicBoolean(false);
-		private final AtomicInteger session = new AtomicInteger();
-		private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-
-		private volatile Thread captureThread;
+		private final Object lock = new Object();
+		private volatile boolean running;
+		private volatile boolean ready;
 		private volatile TargetDataLine line;
-		private volatile float sampleRate = 16000f;
+		private Thread worker;
+		private RecordingBuffer buffer;
+		private boolean recording;
+		private long stopAt;
+		private float sampleRate = 16000f;
+		private CompletableFuture<AudioClip> completion;
 
-		public boolean isRecording() {
-			return recording.get();
-		}
-
-		public float sampleRate() {
-			return sampleRate;
-		}
-
-		public void start() {
-			if (!recording.compareAndSet(false, true)) {
-				return;
-			}
-			int id = session.incrementAndGet();
-			synchronized (buffer) {
-				buffer.reset();
-			}
-			LOGGER.debug("Microphone start");
-			Thread thread = new Thread(() -> captureLoop(id), "voiceinject-mic");
-			thread.setDaemon(true);
-			captureThread = thread;
-			thread.start();
-		}
-
-		public byte[] stop() {
-			if (!recording.compareAndSet(true, false)) {
-				return new byte[0];
-			}
-			TargetDataLine toClose;
-			synchronized (session) {
-				session.incrementAndGet();
-				toClose = line;
-				line = null;
-			}
-			if (toClose != null) {
-				closeQuietly(toClose);
-			}
-			Thread thread = captureThread;
-			if (thread != null) {
-				try {
-					thread.join(JOIN_TIMEOUT_MS);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-				}
-			}
-			captureThread = null;
-			byte[] pcm;
-			synchronized (buffer) {
-				pcm = buffer.toByteArray();
-			}
-			LOGGER.debug("Microphone stop ({} bytes)", pcm.length);
-			return pcm;
-		}
-
-		private void captureLoop(int id) {
-			TargetDataLine opened = null;
-			boolean started = false;
-			try {
-				opened = openLine();
-				if (opened == null) {
-					LOGGER.error("No supported microphone line (tried 16/48/44.1 kHz 16-bit mono)");
-					return;
-				}
-				if (!publishLine(id, opened)) {
-					return;
-				}
-				sampleRate = opened.getFormat().getSampleRate();
-				opened.start();
-				started = true;
-				//DEBUG
-				debugChat("Microphone activated");
-				LOGGER.debug("Microphone line started ({})", opened.getFormat());
-
-				int maxBytes = maxBytesFor(opened.getFormat());
-				byte[] chunk = new byte[READ_CHUNK];
-				while (recording.get() && session.get() == id) {
-					int n = opened.read(chunk, 0, chunk.length);
-					if (n <= 0) {
-						break;
-					}
-					synchronized (buffer) {
-						if (session.get() != id || buffer.size() >= maxBytes) {
-							break;
-						}
-						int toWrite = Math.min(n, maxBytes - buffer.size());
-						buffer.write(chunk, 0, toWrite);
-					}
-				}
-			} catch (LineUnavailableException e) {
-				LOGGER.error("Microphone unavailable", e);
-			} catch (SecurityException e) {
-				LOGGER.error("Microphone permission denied", e);
-			} catch (RuntimeException e) {
-				LOGGER.error("Microphone capture failed", e);
-			} finally {
-				if (opened != null) {
-					closeQuietly(opened);
-				}
-				if (started) {
-					//DEBUG
-					debugChat("Microphone deactivated");
-				}
-				synchronized (session) {
-					if (line == opened) {
-						line = null;
-					}
-				}
+		public record AudioClip(byte[] pcm, float sampleRate) {}
+		public boolean isRecording() { synchronized (lock) { return recording; } }
+		public void warmUp() {
+			synchronized (lock) {
+				if (running || (worker != null && worker.isAlive())) return;
+				running = true;
+				worker = new Thread(this::captureLoop, "voiceinject-mic");
+				worker.setDaemon(true);
+				worker.start();
 			}
 		}
-
-		private boolean publishLine(int id, TargetDataLine opened) {
-			synchronized (session) {
-				if (session.get() != id) {
-					return false;
-				}
-				line = opened;
+		public boolean start() {
+			synchronized (lock) {
+				if (!ready || recording) return false;
+				buffer.start();
+				recording = true;
+				stopAt = Long.MAX_VALUE;
+				completion = new CompletableFuture<>();
 				return true;
 			}
 		}
-
+		public CompletableFuture<AudioClip> stop() {
+			synchronized (lock) {
+				if (completion == null) return CompletableFuture.completedFuture(new AudioClip(new byte[0], sampleRate));
+				if (recording && stopAt == Long.MAX_VALUE) stopAt = System.nanoTime() + 200_000_000L;
+				return completion;
+			}
+		}
+		public boolean hasCompletedRecording() {
+			synchronized (lock) { return completion != null && completion.isDone(); }
+		}
+		public void discard() {
+			synchronized (lock) {
+				recording = false;
+				if (buffer != null) buffer.discard();
+				if (completion != null && !completion.isDone()) completion.cancel(false);
+				completion = null;
+			}
+		}
+		public void close() {
+			running = false;
+			ready = false;
+			discard();
+			TargetDataLine current = line;
+			if (current != null) current.close();
+		}
+		private void captureLoop() {
+			TargetDataLine opened = null;
+			try {
+				opened = openLine();
+				synchronized (lock) {
+					if (!running) return;
+					line = opened;
+					sampleRate = opened.getFormat().getSampleRate();
+					buffer = new RecordingBuffer((int) sampleRate / 4 * 2, (int) sampleRate * 2 * 30);
+					opened.start();
+					ready = true;
+				}
+				byte[] chunk = new byte[2048];
+				while (running) {
+					// Read only available whole samples so stop never drops a blocked read.
+					int count = Math.min(opened.available(), chunk.length) & ~1;
+					if (count > 0) count = opened.read(chunk, 0, count);
+					synchronized (lock) {
+						if (!running) break;
+						if (count > 0) buffer.append(chunk, count);
+						if (recording && (buffer.full() || System.nanoTime() >= stopAt)) {
+							recording = false;
+							completion.complete(new AudioClip(buffer.finish(), sampleRate));
+						}
+					}
+					if (count == 0) Thread.sleep(5);
+				}
+			} catch (Exception e) {
+				if (running) LOGGER.error("Microphone capture failed", e);
+				synchronized (lock) {
+					if (completion != null && !completion.isDone()) completion.completeExceptionally(e);
+				}
+			} finally {
+				if (opened != null) opened.close();
+				synchronized (lock) { ready = false; running = false; recording = false; line = null; }
+			}
+		}
 		private static TargetDataLine openLine() throws LineUnavailableException {
-			LineUnavailableException lastUnavailable = null;
-			for (float sampleRate : SAMPLE_RATES) {
-				AudioFormat format = pcmMonoLe(sampleRate);
+			for (float rate : new float[] {16000f, 48000f, 44100f}) {
+				AudioFormat format = new AudioFormat(rate, 16, 1, true, false);
 				DataLine.Info info = new DataLine.Info(TargetDataLine.class, format);
-				if (!AudioSystem.isLineSupported(info)) {
-					continue;
-				}
+				if (!AudioSystem.isLineSupported(info)) continue;
+				TargetDataLine candidate = null;
 				try {
-					TargetDataLine opened = (TargetDataLine) AudioSystem.getLine(info);
-					opened.open(format);
-					LOGGER.debug("Opened microphone at {} Hz", (int) sampleRate);
-					return opened;
+					candidate = (TargetDataLine) AudioSystem.getLine(info);
+					candidate.open(format);
+					return candidate;
 				} catch (LineUnavailableException e) {
-					lastUnavailable = e;
-					LOGGER.debug("Microphone {} Hz unavailable", (int) sampleRate, e);
+					if (candidate != null) candidate.close();
 				}
 			}
-			if (lastUnavailable != null) {
-				throw lastUnavailable;
-			}
-			return null;
-		}
-
-		private static AudioFormat pcmMonoLe(float sampleRate) {
-			return new AudioFormat(sampleRate, SAMPLE_BITS, CHANNELS, true, false);
-		}
-
-		private static int maxBytesFor(AudioFormat format) {
-			int bytesPerSecond = (int) (format.getSampleRate() * (format.getSampleSizeInBits() / 8) * format.getChannels());
-			return bytesPerSecond * MAX_SECONDS;
-		}
-
-		private static void debugChat(String message) {
-			Minecraft client = Minecraft.getInstance();
-			client.execute(() -> {
-				if (client.player != null) {
-					client.player.sendSystemMessage(Component.literal(message));
-				}
-			});
-		}
-
-		private static void closeQuietly(TargetDataLine current) {
-			try {
-				current.stop();
-			} catch (RuntimeException ignored) {
-			}
-			try {
-				current.flush();
-			} catch (RuntimeException ignored) {
-			}
-			try {
-				current.close();
-			} catch (RuntimeException ignored) {
-			}
+			throw new LineUnavailableException("No supported microphone input");
 		}
 	}
 
 	/** Converts captured audio into chat text. */
 	public static final class SpeechToText {
 		private static final float TARGET_RATE = 16000f;
-		private static final String MODEL_NAME = "vosk-model-small-en-us-0.15";
-		private static final URI MODEL_URL = URI.create("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip");
+		private static final String MODEL_NAME = "vosk-model-en-us-0.22-lgraph";
+		private static final URI MODEL_URL = URI.create("https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip");
 
 		private final ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
 			Thread thread = new Thread(runnable, "voiceinject-stt");
@@ -370,9 +349,8 @@ public final class Main implements ClientModInitializer {
 					LOGGER.debug("Vosk result: {}", text);
 					return text;
 				}
-			} catch (Throwable t) {
-				LOGGER.error("Speech-to-text failed", t);
-				return List.of();
+			} catch (Exception t) {
+				throw new java.util.concurrent.CompletionException(t);
 			}
 		}
 
@@ -384,6 +362,9 @@ public final class Main implements ClientModInitializer {
 			Path modelDir = ensureModelOnDisk();
 			LOGGER.info("Loading Vosk model from {}", modelDir);
 			model = new Model(modelDir.toString());
+			// Remove the superseded download only after the replacement loads successfully.
+			try { deleteRecursively(modelDir.getParent().resolve("vosk-model-small-en-us-0.15")); }
+			catch (IOException e) { LOGGER.warn("Could not remove the old speech model", e); }
 			return model;
 		}
 
@@ -413,7 +394,7 @@ public final class Main implements ClientModInitializer {
 
 		private static boolean isModelReady(Path modelDir) {
 			return Files.isRegularFile(modelDir.resolve("conf").resolve("model.conf"))
-					|| Files.isRegularFile(modelDir.resolve("am").resolve("final.mdl"));
+					&& Files.isRegularFile(modelDir.resolve("am").resolve("final.mdl"));
 		}
 
 		private static void download(URI uri, Path dest) throws IOException, InterruptedException {
@@ -457,13 +438,9 @@ public final class Main implements ClientModInitializer {
 				return;
 			}
 			try (Stream<Path> walk = Files.walk(root)) {
-				walk.sorted(Comparator.reverseOrder()).forEach(path -> {
-					try {
-						Files.deleteIfExists(path);
-					} catch (IOException e) {
-						throw new RuntimeException(e);
-					}
-				});
+				for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
+					Files.deleteIfExists(path);
+				}
 			} catch (RuntimeException e) {
 				if (e.getCause() instanceof IOException io) {
 					throw io;
@@ -587,31 +564,30 @@ public final class Main implements ClientModInitializer {
 				sending = false;
 				pending = List.of();
 				holdWasDown = false;
-				if (microphone.isRecording()) microphone.stop();
+				microphone.close();
+				if (client.player != null) microphone.warmUp();
 				drainClicks();
 				return;
 			}
-			if (sending) {
-				drainClicks();
-				return;
-			}
-
-			while (Keybinds.cycleMode.consumeClick()) {
-				config.cycleMode();
-				pending = List.of();
-				client.gui.hud.setOverlayMessage(Component.empty(), false);
-				if (microphone.isRecording()) {
-					microphone.stop();
+			while (Keybinds.openConfig.consumeClick()) {
+				if (client.gui.screen() == null) {
+					session++;
+					sending = false;
+					pending = List.of();
+					microphone.discard();
+					holdWasDown = false;
+					client.gui.hud.setOverlayMessage(Component.empty(), false);
+					client.gui.setScreen(new ConfigScreen(null, config));
+					drainClicks();
+					return;
 				}
-				holdWasDown = false;
-				client.player.sendSystemMessage(
-						Component.literal("voiceinject mode: " + config.mode.name().toLowerCase())
-				);
 			}
+			if (sending) { drainClicks(); return; }
+			if (microphone.hasCompletedRecording()) { finishSession(client); return; }
 
 			while (Keybinds.cycleAlternative.consumeClick()) {
 				if (!pending.isEmpty() && client.gui.screen() == null) {
-					selected = (selected + 1) % pending.size();
+					selected = (selected + 1) % (pending.size() + 1);
 				}
 			}
 			if (!pending.isEmpty()) showPreview(client);
@@ -623,11 +599,18 @@ public final class Main implements ClientModInitializer {
 			}
 		}
 
+		private void startRecording(Minecraft client) {
+			if (!microphone.start()) {
+				microphone.warmUp();
+				client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.mic_not_ready"), false);
+			}
+		}
+
 		private void tickHold(Minecraft client) {
 			boolean down = Keybinds.record.isDown() && client.gui.screen() == null;
 			if (down && !holdWasDown) {
-				microphone.start();
-			} else if (!down && holdWasDown) {
+				startRecording(client);
+			} else if (!down && holdWasDown && microphone.isRecording()) {
 				finishSession(client);
 			}
 			holdWasDown = down;
@@ -639,7 +622,7 @@ public final class Main implements ClientModInitializer {
 					continue;
 				}
 				if (!pending.isEmpty()) {
-					chat.send(client, pending.get(selected));
+					if (selected < pending.size()) chat.send(client, pending.get(selected));
 					pending = List.of();
 					client.gui.hud.setOverlayMessage(Component.empty(), false);
 					drainClicks();
@@ -649,31 +632,33 @@ public final class Main implements ClientModInitializer {
 					drainClicks();
 					return;
 				} else {
-					microphone.start();
+					startRecording(client);
 				}
 			}
 		}
 
 		private void showPreview(Minecraft client) {
 			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.preview",
-					selected + 1, pending.size(), pending.get(selected),
+					selected + 1, pending.size() + 1,
+					selected == pending.size() ? Component.translatable("voiceinject.discard") : Component.literal(pending.get(selected)),
 					Keybinds.cycleAlternative.getTranslatedKeyMessage(),
 					Keybinds.record.getTranslatedKeyMessage()), false);
 		}
 
 		private void finishSession(Minecraft client) {
-			float rate = microphone.sampleRate();
-			byte[] pcm = microphone.stop();
+			CompletableFuture<MicrophoneCapture.AudioClip> captured = microphone.stop();
 			sending = true;
 			int requestSession = session;
 			boolean preview = config.mode == RecordingMode.TAP;
 			if (preview) client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
-			speechToText.transcribe(pcm, rate).whenComplete((text, error) -> client.execute(() -> {
+			captured.thenCompose(clip -> speechToText.transcribe(clip.pcm(), clip.sampleRate())).whenComplete((text, error) -> client.execute(() -> {
 				if (requestSession != session || client.player == null || client.player.connection != connection) return;
 				drainClicks();
 				sending = false;
+				microphone.discard();
 				if (error != null) {
 					LOGGER.error("Speech-to-text failed", error);
+					client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.failed"), false);
 					return;
 				}
 				if (text.isEmpty()) {
@@ -694,7 +679,7 @@ public final class Main implements ClientModInitializer {
 			while (Keybinds.record.consumeClick()) {
 				// drop buffered presses while a send is in flight or the player is missing
 			}
-			while (Keybinds.cycleMode.consumeClick()) {
+			while (Keybinds.openConfig.consumeClick()) {
 			}
 		}
 	}
