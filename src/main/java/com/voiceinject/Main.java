@@ -76,12 +76,16 @@ public final class Main implements ClientModInitializer {
 		config = Config.load();
 		Keybinds.register();
 
+		SpeechToText speechToText = new SpeechToText();
 		controller = new VoiceController(
 				config,
 				new MicrophoneCapture(),
-				new SpeechToText(),
+				speechToText,
 				new ChatInjector()
 		);
+		// Download and load the 128 MB model in the background so the first recording
+		// isn't blocked by a multi-minute download on the transcription thread.
+		speechToText.preload();
 
 		ClientTickEvents.END_CLIENT_TICK.register(controller::tick);
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> controller.microphone.close());
@@ -283,6 +287,7 @@ public final class Main implements ClientModInitializer {
 		private volatile boolean ready;
 		private volatile TargetDataLine line;
 		private Thread worker;
+		private int generation;
 		private RecordingBuffer buffer;
 		private boolean recording;
 		private long stopAt;
@@ -293,9 +298,10 @@ public final class Main implements ClientModInitializer {
 		public boolean isRecording() { synchronized (lock) { return recording; } }
 		public void warmUp() {
 			synchronized (lock) {
-				if (running || (worker != null && worker.isAlive())) return;
+				if (ready || running) return;
+				int gen = ++generation;
 				running = true;
-				worker = new Thread(this::captureLoop, "voiceinject-mic");
+				worker = new Thread(() -> captureLoop(gen), "voiceinject-mic");
 				worker.setDaemon(true);
 				worker.start();
 			}
@@ -329,18 +335,21 @@ public final class Main implements ClientModInitializer {
 			}
 		}
 		public void close() {
-			running = false;
-			ready = false;
+			synchronized (lock) {
+				generation++;
+				running = false;
+				ready = false;
+			}
 			discard();
 			TargetDataLine current = line;
 			if (current != null) current.close();
 		}
-		private void captureLoop() {
+		private void captureLoop(int gen) {
 			TargetDataLine opened = null;
 			try {
 				opened = openLine();
 				synchronized (lock) {
-					if (!running) return;
+					if (gen != generation || !running) return;
 					line = opened;
 					sampleRate = opened.getFormat().getSampleRate();
 					buffer = new RecordingBuffer((int) sampleRate / 4 * 2, (int) sampleRate * 2 * 30);
@@ -348,12 +357,15 @@ public final class Main implements ClientModInitializer {
 					ready = true;
 				}
 				byte[] chunk = new byte[2048];
-				while (running) {
+				while (true) {
+					synchronized (lock) {
+						if (gen != generation || !running) break;
+					}
 					// Read only available whole samples so stop never drops a blocked read.
 					int count = Math.min(opened.available(), chunk.length) & ~1;
 					if (count > 0) count = opened.read(chunk, 0, count);
 					synchronized (lock) {
-						if (!running) break;
+						if (gen != generation || !running) break;
 						if (count > 0) buffer.append(chunk, count);
 						if (recording && (buffer.full() || System.nanoTime() >= stopAt)) {
 							recording = false;
@@ -363,13 +375,15 @@ public final class Main implements ClientModInitializer {
 					if (count == 0) Thread.sleep(5);
 				}
 			} catch (Exception e) {
-				if (running) LOGGER.error("Microphone capture failed", e);
+				if (gen == generation && running) LOGGER.error("Microphone capture failed", e);
 				synchronized (lock) {
-					if (completion != null && !completion.isDone()) completion.completeExceptionally(e);
+					if (gen == generation && completion != null && !completion.isDone()) completion.completeExceptionally(e);
 				}
 			} finally {
 				if (opened != null) opened.close();
-				synchronized (lock) { ready = false; running = false; recording = false; line = null; }
+				synchronized (lock) {
+					if (gen == generation) { ready = false; running = false; recording = false; line = null; }
+				}
 			}
 		}
 		private static TargetDataLine openLine() throws LineUnavailableException {
@@ -406,6 +420,18 @@ public final class Main implements ClientModInitializer {
 
 		public CompletableFuture<List<String>> transcribe(byte[] pcm, float sampleRate) {
 			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm, sampleRate), executor);
+		}
+
+		/** Downloads and loads the speech model in the background so the first recording isn't blocked by the 128 MB download. */
+		public void preload() {
+			executor.submit(() -> {
+				try {
+					ensureModel();
+					LOGGER.info("Vosk model loaded and ready");
+				} catch (Exception e) {
+					LOGGER.error("Vosk model preload failed; will retry on first recording", e);
+				}
+			});
 		}
 
 		private List<String> transcribeBlocking(byte[] pcm, float sampleRate) {
@@ -764,7 +790,7 @@ public final class Main implements ClientModInitializer {
 			int requestSession = session;
 			boolean preview = config.mode == RecordingMode.TAP;
 			String command = selectedCommand();
-			if (preview) client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
+			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
 			captured.thenCompose(clip -> speechToText.transcribe(clip.pcm(), clip.sampleRate())).whenComplete((text, error) -> client.execute(() -> {
 				if (requestSession != session || client.player == null || client.player.connection != connection) return;
 				drainClicks();
@@ -783,6 +809,7 @@ public final class Main implements ClientModInitializer {
 					showPreview(client);
 				} else {
 					chat.send(client, HotCommands.forSpeech(command, text.get(0)));
+					client.gui.hud.setOverlayMessage(Component.empty(), false);
 				}
 			}));
 		}
