@@ -7,6 +7,7 @@
 	"voiceinject.no_speech": "No speech recognized. Record again.",
 	"key.voiceinject.open_config": "VoiceInject settings",
 	"voiceinject.settings": "VoiceInject settings",
+	"voiceinject.keybinds": "Configure keybinds",
 	"voiceinject.mode": "Recording mode: %s",
 	"voiceinject.mode.hold": "Hold",
 	"voiceinject.mode.tap": "Tap",

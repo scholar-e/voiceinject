@@ -1,5 +1,6 @@
 package com.voiceinject;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -16,6 +17,8 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 
 import java.util.stream.Stream;
@@ -49,6 +52,7 @@ import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
 import net.fabricmc.loader.api.FabricLoader;
 
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.options.controls.KeyBindsScreen;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -76,16 +80,12 @@ public final class Main implements ClientModInitializer {
 		config = Config.load();
 		Keybinds.register();
 
-		SpeechToText speechToText = new SpeechToText();
 		controller = new VoiceController(
 				config,
 				new MicrophoneCapture(),
-				speechToText,
+				new SpeechToText(),
 				new ChatInjector()
 		);
-		// Download and load the 128 MB model in the background so the first recording
-		// isn't blocked by a multi-minute download on the transcription thread.
-		speechToText.preload();
 
 		ClientTickEvents.END_CLIENT_TICK.register(controller::tick);
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> controller.microphone.close());
@@ -174,18 +174,21 @@ public final class Main implements ClientModInitializer {
 				settings.mode = settings.mode == RecordingMode.HOLD ? RecordingMode.TAP : RecordingMode.HOLD;
 				saveFailed = !settings.save();
 				button.setMessage(modeLabel());
-			}).bounds(width / 2 - 100, height / 2 - 24, 200, 20).build());
+			}).bounds(width / 2 - 100, height / 2 - 44, 200, 20).build());
+			addRenderableWidget(Button.builder(Component.translatable("voiceinject.keybinds"), button ->
+					minecraft.gui.setScreen(new KeyBindsScreen(this, minecraft.options)))
+					.bounds(width / 2 - 100, height / 2 - 20, 200, 20).build());
 			addRenderableWidget(Button.builder(Component.translatable("voiceinject.hot.title"), button ->
 					minecraft.gui.setScreen(new HotCommandScreen(this, settings)))
-					.bounds(width / 2 - 100, height / 2 + 28, 200, 20).build());
+					.bounds(width / 2 - 100, height / 2 + 4, 200, 20).build());
 			addRenderableWidget(Button.builder(Component.translatable("gui.done"), button -> onClose())
-					.bounds(width / 2 - 100, height / 2 + 50, 200, 20).build());
+					.bounds(width / 2 - 100, height / 2 + 56, 200, 20).build());
 		}
 		@Override public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
 			super.extractRenderState(graphics, mouseX, mouseY, partialTick);
-			graphics.centeredText(font, title, width / 2, height / 2 - 60, 0xFFFFFFFF);
-			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 8, 0xFFCCCCCC);
-			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 76, 0xFFFF5555);
+			graphics.centeredText(font, title, width / 2, height / 2 - 76, 0xFFFFFFFF);
+			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 32, 0xFFCCCCCC);
+			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 80, 0xFFFF5555);
 		}
 		@Override public void onClose() { minecraft.gui.setScreen(parent); }
 		@Override public boolean isPauseScreen() { return false; }
@@ -280,109 +283,93 @@ public final class Main implements ClientModInitializer {
 		}
 	}
 
-	/** Keeps 250 ms of local pre-roll and completes recordings after a 200 ms tail. */
+	/** Captures PCM from a fresh microphone line for each recording. */
 	public static final class MicrophoneCapture {
-		private final Object lock = new Object();
-		private volatile boolean running;
-		private volatile boolean ready;
+		private static final float[] SAMPLE_RATES = {16000f, 48000f, 44100f};
+		private static final int MAX_SECONDS = 30;
+		private static final int READ_CHUNK = 4096;
+		private static final long JOIN_TIMEOUT_MS = 500L;
+
+		private final AtomicBoolean recording = new AtomicBoolean();
+		private final AtomicInteger session = new AtomicInteger();
+		private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 		private volatile TargetDataLine line;
-		private Thread worker;
-		private int generation;
-		private RecordingBuffer buffer;
-		private boolean recording;
-		private long stopAt;
-		private float sampleRate = 16000f;
-		private CompletableFuture<AudioClip> completion;
+		private volatile Thread worker;
+		private volatile float sampleRate = 16000f;
 
 		public record AudioClip(byte[] pcm, float sampleRate) {}
-		public boolean isRecording() { synchronized (lock) { return recording; } }
-		public void warmUp() {
-			synchronized (lock) {
-				if (ready || running) return;
-				int gen = ++generation;
-				running = true;
-				worker = new Thread(() -> captureLoop(gen), "voiceinject-mic");
-				worker.setDaemon(true);
-				worker.start();
-			}
-		}
+		public boolean isRecording() { return recording.get(); }
+		public void warmUp() { /* A line is opened only while actively recording. */ }
 		public boolean start() {
-			synchronized (lock) {
-				if (!ready || recording) return false;
-				buffer.start();
-				recording = true;
-				stopAt = Long.MAX_VALUE;
-				completion = new CompletableFuture<>();
-				return true;
+			if (!recording.compareAndSet(false, true)) return false;
+			int id = session.incrementAndGet();
+			synchronized (buffer) {
+				buffer.reset();
 			}
+			Thread capture = new Thread(() -> captureLoop(id), "voiceinject-mic");
+			capture.setDaemon(true);
+			worker = capture;
+			capture.start();
+			LOGGER.debug("Microphone recording started");
+			return true;
 		}
 		public CompletableFuture<AudioClip> stop() {
-			synchronized (lock) {
-				if (completion == null) return CompletableFuture.completedFuture(new AudioClip(new byte[0], sampleRate));
-				if (recording && stopAt == Long.MAX_VALUE) stopAt = System.nanoTime() + 200_000_000L;
-				return completion;
+			if (!recording.compareAndSet(true, false)) {
+				return CompletableFuture.completedFuture(new AudioClip(new byte[0], sampleRate));
 			}
-		}
-		public boolean hasCompletedRecording() {
-			synchronized (lock) { return completion != null && completion.isDone(); }
-		}
-		public void discard() {
-			synchronized (lock) {
-				recording = false;
-				if (buffer != null) buffer.discard();
-				if (completion != null && !completion.isDone()) completion.cancel(false);
-				completion = null;
-			}
-		}
-		public void close() {
-			synchronized (lock) {
-				generation++;
-				running = false;
-				ready = false;
-			}
-			discard();
+			session.incrementAndGet();
 			TargetDataLine current = line;
-			if (current != null) current.close();
+			line = null;
+			if (current != null) closeQuietly(current);
+			Thread capture = worker;
+			if (capture != null && capture != Thread.currentThread()) {
+				try {
+					capture.join(JOIN_TIMEOUT_MS);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+			}
+			worker = null;
+			byte[] pcm;
+			synchronized (buffer) { pcm = buffer.toByteArray(); }
+			LOGGER.debug("Microphone recording stopped ({} bytes)", pcm.length);
+			return CompletableFuture.completedFuture(new AudioClip(pcm, sampleRate));
 		}
-		private void captureLoop(int gen) {
+		public boolean hasCompletedRecording() { return false; }
+		public void discard() {
+			if (recording.get()) stop();
+			synchronized (buffer) { buffer.reset(); }
+		}
+		public void close() { discard(); }
+
+		private void captureLoop(int id) {
 			TargetDataLine opened = null;
 			try {
 				opened = openLine();
-				synchronized (lock) {
-					if (gen != generation || !running) return;
+				synchronized (session) {
+					if (!recording.get() || session.get() != id) return;
 					line = opened;
-					sampleRate = opened.getFormat().getSampleRate();
-					buffer = new RecordingBuffer((int) sampleRate / 4 * 2, (int) sampleRate * 2 * 30);
-					opened.start();
-					ready = true;
 				}
-				byte[] chunk = new byte[2048];
-				while (true) {
-					synchronized (lock) {
-						if (gen != generation || !running) break;
+				sampleRate = opened.getFormat().getSampleRate();
+				opened.start();
+				int maximum = (int) sampleRate * 2 * MAX_SECONDS;
+				byte[] chunk = new byte[READ_CHUNK];
+				while (recording.get() && session.get() == id) {
+					int count = opened.read(chunk, 0, chunk.length);
+					if (count <= 0) break;
+					synchronized (buffer) {
+						if (session.get() != id || buffer.size() >= maximum) break;
+						buffer.write(chunk, 0, Math.min(count, maximum - buffer.size()));
 					}
-					// Read only available whole samples so stop never drops a blocked read.
-					int count = Math.min(opened.available(), chunk.length) & ~1;
-					if (count > 0) count = opened.read(chunk, 0, count);
-					synchronized (lock) {
-						if (gen != generation || !running) break;
-						if (count > 0) buffer.append(chunk, count);
-						if (recording && (buffer.full() || System.nanoTime() >= stopAt)) {
-							recording = false;
-							completion.complete(new AudioClip(buffer.finish(), sampleRate));
-						}
-					}
-					if (count == 0) Thread.sleep(5);
 				}
-			} catch (Exception e) {
-				if (gen == generation && running) LOGGER.error("Microphone capture failed", e);
-				synchronized (lock) {
-					if (gen == generation && completion != null && !completion.isDone()) completion.completeExceptionally(e);
-				}
+			} catch (LineUnavailableException e) {
+				LOGGER.error("Microphone unavailable", e);
+			} catch (RuntimeException e) {
+				if (recording.get()) LOGGER.error("Microphone capture failed", e);
 			} finally {
-				if (opened != null) opened.close();
-				synchronized (lock) {
-					if (gen == generation) { ready = false; running = false; recording = false; line = null; }
+				if (opened != null) closeQuietly(opened);
+				synchronized (session) {
+					if (line == opened) line = null;
 				}
 			}
 		}
@@ -402,6 +389,12 @@ public final class Main implements ClientModInitializer {
 			}
 			throw new LineUnavailableException("No supported microphone input");
 		}
+
+		private static void closeQuietly(TargetDataLine current) {
+			try { current.stop(); } catch (RuntimeException ignored) {}
+			try { current.flush(); } catch (RuntimeException ignored) {}
+			try { current.close(); } catch (RuntimeException ignored) {}
+		}
 	}
 
 	/** Converts captured audio into chat text. */
@@ -420,18 +413,6 @@ public final class Main implements ClientModInitializer {
 
 		public CompletableFuture<List<String>> transcribe(byte[] pcm, float sampleRate) {
 			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm, sampleRate), executor);
-		}
-
-		/** Downloads and loads the speech model in the background so the first recording isn't blocked by the 128 MB download. */
-		public void preload() {
-			executor.submit(() -> {
-				try {
-					ensureModel();
-					LOGGER.info("Vosk model loaded and ready");
-				} catch (Exception e) {
-					LOGGER.error("Vosk model preload failed; will retry on first recording", e);
-				}
-			});
 		}
 
 		private List<String> transcribeBlocking(byte[] pcm, float sampleRate) {
@@ -657,6 +638,7 @@ public final class Main implements ClientModInitializer {
 		private int hotCommand = -1;
 		private int session;
 		private Object connection;
+		private boolean showConfigOnBoot = true;
 
 		public VoiceController(Config config, MicrophoneCapture microphone, SpeechToText speechToText, ChatInjector chat) {
 			this.config = config;
@@ -666,6 +648,13 @@ public final class Main implements ClientModInitializer {
 		}
 
 		public void tick(Minecraft client) {
+			if (showConfigOnBoot && client.gui.overlay() == null && client.gui.screen() != null) {
+				showConfigOnBoot = false;
+				Screen parent = client.gui.screen();
+				client.gui.setScreen(new ConfigScreen(parent, config));
+				drainClicks();
+				return;
+			}
 			if (client.player == null || connection != client.player.connection) {
 				connection = client.player == null ? null : client.player.connection;
 				session++;
