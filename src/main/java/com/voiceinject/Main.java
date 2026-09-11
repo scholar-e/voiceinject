@@ -302,11 +302,25 @@ public final class Main implements ClientModInitializer {
 		public void warmUp() { /* A line is opened only while actively recording. */ }
 		public boolean start() {
 			if (!recording.compareAndSet(false, true)) return false;
-			int id = session.incrementAndGet();
 			synchronized (buffer) {
 				buffer.reset();
 			}
-			Thread capture = new Thread(() -> captureLoop(id), "voiceinject-mic");
+			TargetDataLine opened;
+			try {
+				opened = openLine();
+				opened.start();
+			} catch (LineUnavailableException | SecurityException e) {
+				recording.set(false);
+				LOGGER.error("Could not start microphone recording", e);
+				return false;
+			}
+			int id;
+			synchronized (session) {
+				id = session.incrementAndGet();
+				line = opened;
+				sampleRate = opened.getFormat().getSampleRate();
+			}
+			Thread capture = new Thread(() -> captureLoop(id, opened), "voiceinject-mic");
 			capture.setDaemon(true);
 			worker = capture;
 			capture.start();
@@ -317,9 +331,7 @@ public final class Main implements ClientModInitializer {
 			if (!recording.compareAndSet(true, false)) {
 				return CompletableFuture.completedFuture(new AudioClip(new byte[0], sampleRate));
 			}
-			session.incrementAndGet();
 			TargetDataLine current = line;
-			line = null;
 			if (current != null) closeQuietly(current);
 			Thread capture = worker;
 			if (capture != null && capture != Thread.currentThread()) {
@@ -330,9 +342,13 @@ public final class Main implements ClientModInitializer {
 				}
 			}
 			worker = null;
+			synchronized (session) {
+				session.incrementAndGet();
+				if (line == current) line = null;
+			}
 			byte[] pcm;
 			synchronized (buffer) { pcm = buffer.toByteArray(); }
-			LOGGER.debug("Microphone recording stopped ({} bytes)", pcm.length);
+			LOGGER.info("Microphone recording stopped ({} bytes at {} Hz)", pcm.length, (int) sampleRate);
 			return CompletableFuture.completedFuture(new AudioClip(pcm, sampleRate));
 		}
 		public boolean hasCompletedRecording() { return false; }
@@ -342,16 +358,8 @@ public final class Main implements ClientModInitializer {
 		}
 		public void close() { discard(); }
 
-		private void captureLoop(int id) {
-			TargetDataLine opened = null;
+		private void captureLoop(int id, TargetDataLine opened) {
 			try {
-				opened = openLine();
-				synchronized (session) {
-					if (!recording.get() || session.get() != id) return;
-					line = opened;
-				}
-				sampleRate = opened.getFormat().getSampleRate();
-				opened.start();
 				int maximum = (int) sampleRate * 2 * MAX_SECONDS;
 				byte[] chunk = new byte[READ_CHUNK];
 				while (recording.get() && session.get() == id) {
@@ -362,8 +370,6 @@ public final class Main implements ClientModInitializer {
 						buffer.write(chunk, 0, Math.min(count, maximum - buffer.size()));
 					}
 				}
-			} catch (LineUnavailableException e) {
-				LOGGER.error("Microphone unavailable", e);
 			} catch (RuntimeException e) {
 				if (recording.get()) LOGGER.error("Microphone capture failed", e);
 			} finally {
@@ -429,7 +435,7 @@ public final class Main implements ClientModInitializer {
 					recognizer.setMaxAlternatives(10);
 					recognizer.acceptWaveForm(sixteenKhz, sixteenKhz.length);
 					List<String> text = extractAlternatives(recognizer.getFinalResult());
-					LOGGER.debug("Vosk result: {}", text);
+					LOGGER.info("Vosk returned {} alternative(s): {}", text.size(), text);
 					return text;
 				}
 			} catch (Exception t) {
@@ -784,8 +790,7 @@ public final class Main implements ClientModInitializer {
 			String command = selectedCommand();
 			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
 			captured.thenCompose(clip -> speechToText.transcribe(clip.pcm(), clip.sampleRate())).whenComplete((text, error) -> client.execute(() -> {
-				if (requestSession != session || requestTranscription != transcription
-						|| client.player == null || client.player.connection != connection) return;
+				if (requestSession != session || requestTranscription != transcription || client.player == null) return;
 				drainClicks();
 				microphone.discard();
 				if (error != null) {
