@@ -632,11 +632,11 @@ public final class Main implements ClientModInitializer {
 		private final ChatInjector chat;
 
 		private boolean holdWasDown;
-		private boolean sending;
 		private List<String> pending = List.of();
 		private int selected;
 		private int hotCommand = -1;
 		private int session;
+		private int transcription;
 		private Object connection;
 		private boolean showConfigOnBoot = true;
 
@@ -658,7 +658,7 @@ public final class Main implements ClientModInitializer {
 			if (client.player == null || connection != client.player.connection) {
 				connection = client.player == null ? null : client.player.connection;
 				session++;
-				sending = false;
+				transcription++;
 				pending = List.of();
 				hotCommand = -1;
 				holdWasDown = false;
@@ -670,7 +670,7 @@ public final class Main implements ClientModInitializer {
 			while (Keybinds.openConfig.consumeClick()) {
 				if (client.gui.screen() == null) {
 					session++;
-					sending = false;
+					transcription++;
 					pending = List.of();
 					hotCommand = -1;
 					microphone.discard();
@@ -681,7 +681,6 @@ public final class Main implements ClientModInitializer {
 					return;
 				}
 			}
-			if (sending) { drainClicks(); return; }
 			if (microphone.hasCompletedRecording()) { finishSession(client); return; }
 			while (Keybinds.cycleHotCommand.consumeClick()) {
 				if (client.gui.screen() == null) {
@@ -721,7 +720,11 @@ public final class Main implements ClientModInitializer {
 		}
 
 		private void startRecording(Minecraft client) {
-			if (!microphone.start()) {
+			if (microphone.start()) {
+				// A new recording supersedes any transcription still loading or running.
+				transcription++;
+				client.gui.hud.setOverlayMessage(Component.empty(), false);
+			} else {
 				microphone.warmUp();
 				client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.mic_not_ready"), false);
 			}
@@ -775,15 +778,15 @@ public final class Main implements ClientModInitializer {
 
 		private void finishSession(Minecraft client) {
 			CompletableFuture<MicrophoneCapture.AudioClip> captured = microphone.stop();
-			sending = true;
 			int requestSession = session;
+			int requestTranscription = ++transcription;
 			boolean preview = config.mode == RecordingMode.TAP;
 			String command = selectedCommand();
 			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
 			captured.thenCompose(clip -> speechToText.transcribe(clip.pcm(), clip.sampleRate())).whenComplete((text, error) -> client.execute(() -> {
-				if (requestSession != session || client.player == null || client.player.connection != connection) return;
+				if (requestSession != session || requestTranscription != transcription
+						|| client.player == null || client.player.connection != connection) return;
 				drainClicks();
-				sending = false;
 				microphone.discard();
 				if (error != null) {
 					LOGGER.error("Speech-to-text failed", error);
