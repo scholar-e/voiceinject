@@ -10,7 +10,7 @@ VoiceInject settings open automatically when Minecraft reaches its first screen 
 
 On Linux, microphone capture uses PulseAudio/PipeWire and the selected source; other systems use Java Sound. The microphone opens when recording starts and closes when recording stops. Recordings are capped at 30 seconds.
 
-Recognition uses the local **vosk-model-en-us-0.22-lgraph** model (128 MB download). On first transcription it downloads automatically; the previous small model is deleted from the mod's config folder only after lgraph loads successfully. Recognition may produce fewer than ten distinct predictions. Empty results prompt you to record again.
+Recognition uses the local **vosk-model-small-en-us-0.15** model, restored from the last known-working release. Tap predictions appear both above the hotbar and in system chat. Recognition may produce fewer than ten distinct predictions. Empty results prompt you to record again.
 
 Build with Java 25: `bash gradlew build`. The build includes regression checks for pre-roll ordering, tail inclusion, discard, and the recording length cap.
 

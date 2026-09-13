@@ -495,8 +495,8 @@ public final class Main implements ClientModInitializer {
 	/** Converts captured audio into chat text. */
 	public static final class SpeechToText {
 		private static final float TARGET_RATE = 16000f;
-		private static final String MODEL_NAME = "vosk-model-en-us-0.22-lgraph";
-		private static final URI MODEL_URL = URI.create("https://alphacephei.com/vosk/models/vosk-model-en-us-0.22-lgraph.zip");
+		private static final String MODEL_NAME = "vosk-model-small-en-us-0.15";
+		private static final URI MODEL_URL = URI.create("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip");
 
 		private final ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
 			Thread thread = new Thread(runnable, "voiceinject-stt");
@@ -540,9 +540,6 @@ public final class Main implements ClientModInitializer {
 			Path modelDir = ensureModelOnDisk();
 			LOGGER.info("Loading Vosk model from {}", modelDir);
 			model = new Model(modelDir.toString());
-			// Remove the superseded download only after the replacement loads successfully.
-			try { deleteRecursively(modelDir.getParent().resolve("vosk-model-small-en-us-0.15")); }
-			catch (IOException e) { LOGGER.warn("Could not remove the old speech model", e); }
 			return model;
 		}
 
@@ -729,6 +726,7 @@ public final class Main implements ClientModInitializer {
 		private boolean holdWasDown;
 		private List<String> pending = List.of();
 		private int selected;
+		private int announcedSelection = -1;
 		private int hotCommand = -1;
 		private int session;
 		private int transcription;
@@ -755,6 +753,7 @@ public final class Main implements ClientModInitializer {
 				session++;
 				transcription++;
 				pending = List.of();
+				announcedSelection = -1;
 				hotCommand = -1;
 				holdWasDown = false;
 				microphone.close();
@@ -767,6 +766,7 @@ public final class Main implements ClientModInitializer {
 					session++;
 					transcription++;
 					pending = List.of();
+					announcedSelection = -1;
 					hotCommand = -1;
 					microphone.discard();
 					holdWasDown = false;
@@ -821,7 +821,7 @@ public final class Main implements ClientModInitializer {
 				client.gui.hud.setOverlayMessage(Component.empty(), false);
 			} else {
 				microphone.warmUp();
-				client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.mic_not_ready"), false);
+				showStatus(client, Component.translatable("voiceinject.mic_not_ready"));
 			}
 		}
 
@@ -846,6 +846,7 @@ public final class Main implements ClientModInitializer {
 						return;
 					}
 					pending = List.of();
+					announcedSelection = -1;
 					client.gui.hud.setOverlayMessage(Component.empty(), false);
 					drainClicks();
 					return;
@@ -864,11 +865,19 @@ public final class Main implements ClientModInitializer {
 				client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.hot.preview_too_long"), false);
 				return;
 			}
-			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.preview",
+			Component option = selected == pending.size()
+					? Component.translatable("voiceinject.discard")
+					: Component.literal(HotCommands.forSpeech(selectedCommand(), pending.get(selected)));
+			Component preview = Component.translatable("voiceinject.preview",
 					selected + 1, pending.size() + 1,
-					selected == pending.size() ? Component.translatable("voiceinject.discard") : Component.literal(HotCommands.forSpeech(selectedCommand(), pending.get(selected))),
+					option,
 					Keybinds.cycleAlternative.getTranslatedKeyMessage(),
-					Keybinds.record.getTranslatedKeyMessage()), false);
+					Keybinds.record.getTranslatedKeyMessage());
+			client.gui.hud.setOverlayMessage(preview, false);
+			if (announcedSelection != selected) {
+				announcedSelection = selected;
+				client.player.sendSystemMessage(preview);
+			}
 		}
 
 		private void finishSession(Minecraft client) {
@@ -884,20 +893,26 @@ public final class Main implements ClientModInitializer {
 				microphone.discard();
 				if (error != null) {
 					LOGGER.error("Speech-to-text failed", error);
-					client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.failed"), false);
+					showStatus(client, Component.translatable("voiceinject.failed"));
 					return;
 				}
 				if (text.isEmpty()) {
-					client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.no_speech"), false);
+					showStatus(client, Component.translatable("voiceinject.no_speech"));
 				} else if (preview) {
 					pending = text;
 					selected = 0;
+					announcedSelection = -1;
 					showPreview(client);
 				} else {
 					chat.send(client, HotCommands.forSpeech(command, text.get(0)));
 					client.gui.hud.setOverlayMessage(Component.empty(), false);
 				}
 			}));
+		}
+
+		private static void showStatus(Minecraft client, Component message) {
+			client.gui.hud.setOverlayMessage(message, false);
+			if (client.player != null) client.player.sendSystemMessage(message);
 		}
 
 		private static void drainClicks() {
