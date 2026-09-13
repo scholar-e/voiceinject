@@ -83,7 +83,7 @@ public final class Main implements ClientModInitializer {
 		controller = new VoiceController(
 				config,
 				new MicrophoneCapture(config),
-				new SpeechToText(),
+				new SpeechToText(config),
 				new ChatInjector()
 		);
 
@@ -116,6 +116,7 @@ public final class Main implements ClientModInitializer {
 	/** Settings saved in the instance config directory. */
 	public static final class Config {
 		public RecordingMode mode = RecordingMode.HOLD;
+		public SpeechModel speechModel = SpeechModel.SMALL;
 		public List<String> hotCommands = List.of();
 		public String microphoneSource = "@DEFAULT_SOURCE@";
 		private static Path path() {
@@ -127,6 +128,7 @@ public final class Main implements ClientModInitializer {
 				try {
 					JsonObject saved = JsonParser.parseString(Files.readString(path())).getAsJsonObject();
 					if (saved.has("mode")) result.mode = RecordingMode.valueOf(saved.get("mode").getAsString());
+					if (saved.has("speechModel")) result.speechModel = SpeechModel.valueOf(saved.get("speechModel").getAsString());
 					if (saved.has("microphoneSource") && saved.get("microphoneSource").isJsonPrimitive()) {
 						result.microphoneSource = saved.get("microphoneSource").getAsString();
 					}
@@ -150,6 +152,7 @@ public final class Main implements ClientModInitializer {
 				try {
 					JsonObject saved = new JsonObject();
 					saved.addProperty("mode", mode.name());
+					saved.addProperty("speechModel", speechModel.name());
 					saved.addProperty("microphoneSource", microphoneSource);
 					JsonArray commands = new JsonArray();
 					hotCommands.forEach(commands::add);
@@ -181,33 +184,43 @@ public final class Main implements ClientModInitializer {
 			if (source.length() > 44) source = source.substring(0, 41) + "...";
 			return Component.translatable("voiceinject.microphone", source);
 		}
+		private Component modelLabel() {
+			return Component.translatable("voiceinject.model",
+					Component.translatable("voiceinject.model." + settings.speechModel.name().toLowerCase(java.util.Locale.ROOT)),
+					settings.speechModel.downloadSize());
+		}
 		@Override protected void init() {
 			List<String> sources = MicrophoneCapture.availableSources();
 			addRenderableWidget(Button.builder(modeLabel(), button -> {
 				settings.mode = settings.mode == RecordingMode.HOLD ? RecordingMode.TAP : RecordingMode.HOLD;
 				saveFailed = !settings.save();
 				button.setMessage(modeLabel());
-			}).bounds(width / 2 - 100, height / 2 - 44, 200, 20).build());
-			addRenderableWidget(Button.builder(Component.translatable("voiceinject.keybinds"), button ->
-					minecraft.gui.setScreen(new KeyBindsScreen(this, minecraft.options)))
-					.bounds(width / 2 - 100, height / 2 - 20, 200, 20).build());
-			addRenderableWidget(Button.builder(Component.translatable("voiceinject.hot.title"), button ->
-					minecraft.gui.setScreen(new HotCommandScreen(this, settings)))
-					.bounds(width / 2 - 100, height / 2 + 4, 200, 20).build());
+			}).bounds(width / 2 - 100, height / 2 - 56, 200, 20).build());
+			addRenderableWidget(Button.builder(modelLabel(), button -> {
+				settings.speechModel = settings.speechModel.next();
+				saveFailed = !settings.save();
+				button.setMessage(modelLabel());
+			}).bounds(width / 2 - 100, height / 2 - 32, 200, 20).build());
 			addRenderableWidget(Button.builder(microphoneLabel(), button -> {
 				int current = sources.indexOf(settings.microphoneSource);
 				settings.microphoneSource = sources.get((current + 1) % sources.size());
 				saveFailed = !settings.save();
 				button.setMessage(microphoneLabel());
-			}).bounds(width / 2 - 100, height / 2 + 28, 200, 20).build());
+			}).bounds(width / 2 - 100, height / 2 - 8, 200, 20).build());
+			addRenderableWidget(Button.builder(Component.translatable("voiceinject.keybinds"), button ->
+					minecraft.gui.setScreen(new KeyBindsScreen(this, minecraft.options)))
+					.bounds(width / 2 - 100, height / 2 + 16, 98, 20).build());
+			addRenderableWidget(Button.builder(Component.translatable("voiceinject.hot.title"), button ->
+					minecraft.gui.setScreen(new HotCommandScreen(this, settings)))
+					.bounds(width / 2 + 2, height / 2 + 16, 98, 20).build());
 			addRenderableWidget(Button.builder(Component.translatable("gui.done"), button -> onClose())
-					.bounds(width / 2 - 100, height / 2 + 72, 200, 20).build());
+					.bounds(width / 2 - 100, height / 2 + 58, 200, 20).build());
 		}
 		@Override public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
 			super.extractRenderState(graphics, mouseX, mouseY, partialTick);
-			graphics.centeredText(font, title, width / 2, height / 2 - 76, 0xFFFFFFFF);
-			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 52, 0xFFCCCCCC);
-			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 96, 0xFFFF5555);
+			graphics.centeredText(font, title, width / 2, height / 2 - 82, 0xFFFFFFFF);
+			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 42, 0xFFCCCCCC);
+			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 82, 0xFFFF5555);
 		}
 		@Override public void onClose() { minecraft.gui.setScreen(parent); }
 		@Override public boolean isPauseScreen() { return false; }
@@ -495,9 +508,8 @@ public final class Main implements ClientModInitializer {
 	/** Converts captured audio into chat text. */
 	public static final class SpeechToText {
 		private static final float TARGET_RATE = 16000f;
-		private static final String MODEL_NAME = "vosk-model-small-en-us-0.15";
-		private static final URI MODEL_URL = URI.create("https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip");
 
+		private final Config config;
 		private final ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
 			Thread thread = new Thread(runnable, "voiceinject-stt");
 			thread.setDaemon(true);
@@ -505,6 +517,9 @@ public final class Main implements ClientModInitializer {
 		});
 
 		private Model model;
+		private SpeechModel loadedModel;
+
+		public SpeechToText(Config config) { this.config = config; }
 
 		public CompletableFuture<List<String>> transcribe(byte[] pcm, float sampleRate) {
 			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm, sampleRate), executor);
@@ -519,7 +534,7 @@ public final class Main implements ClientModInitializer {
 				if (sixteenKhz.length == 0) {
 					return List.of();
 				}
-				Model loaded = ensureModel();
+				Model loaded = ensureModel(config.speechModel);
 				try (Recognizer recognizer = new Recognizer(loaded, TARGET_RATE)) {
 					recognizer.setMaxAlternatives(10);
 					recognizer.acceptWaveForm(sixteenKhz, sixteenKhz.length);
@@ -532,19 +547,23 @@ public final class Main implements ClientModInitializer {
 			}
 		}
 
-		private Model ensureModel() throws IOException, InterruptedException {
-			if (model != null) {
+		private Model ensureModel(SpeechModel selected) throws IOException, InterruptedException {
+			if (model != null && loadedModel == selected) {
 				return model;
 			}
 			LibVosk.setLogLevel(LogLevel.WARNINGS);
-			Path modelDir = ensureModelOnDisk();
-			LOGGER.info("Loading Vosk model from {}", modelDir);
-			model = new Model(modelDir.toString());
+			Path modelDir = ensureModelOnDisk(selected);
+			LOGGER.info("Loading {} Vosk model from {}", selected, modelDir);
+			Model replacement = new Model(modelDir.toString());
+			Model previous = model;
+			model = replacement;
+			loadedModel = selected;
+			if (previous != null) previous.close();
 			return model;
 		}
 
-		private static Path ensureModelOnDisk() throws IOException, InterruptedException {
-			Path modelDir = FabricLoader.getInstance().getConfigDir().resolve("voiceinject").resolve(MODEL_NAME);
+		private static Path ensureModelOnDisk(SpeechModel selected) throws IOException, InterruptedException {
+			Path modelDir = FabricLoader.getInstance().getConfigDir().resolve("voiceinject").resolve(selected.directory());
 			if (isModelReady(modelDir)) {
 				return modelDir;
 			}
@@ -553,10 +572,10 @@ public final class Main implements ClientModInitializer {
 			}
 			Path parent = modelDir.getParent();
 			Files.createDirectories(parent);
-			LOGGER.info("Downloading Vosk model from {}", MODEL_URL);
+			LOGGER.info("Downloading {} Vosk model ({}) from {}", selected, selected.downloadSize(), selected.downloadUri());
 			Path zip = Files.createTempFile("voiceinject-vosk-", ".zip");
 			try {
-				download(MODEL_URL, zip);
+				download(selected.downloadUri(), zip);
 				unzip(zip, parent);
 			} finally {
 				Files.deleteIfExists(zip);
@@ -578,7 +597,7 @@ public final class Main implements ClientModInitializer {
 					.connectTimeout(Duration.ofSeconds(30))
 					.build();
 			HttpRequest request = HttpRequest.newBuilder(uri)
-					.timeout(Duration.ofMinutes(5))
+					.timeout(Duration.ofMinutes(30))
 					.GET()
 					.build();
 			HttpResponse<Path> response = client.send(request, HttpResponse.BodyHandlers.ofFile(dest));

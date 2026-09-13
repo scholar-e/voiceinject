@@ -1,6 +1,5 @@
 plugins {
-	id 'net.fabricmc.fabric-loom' version "${loom_version}"
-	id 'maven-publish'
+	 id 'net.fabricmc.fabric-loom' version "${loom_version}"
 }
 
 version = project.version
@@ -54,43 +53,24 @@ java {
 	targetCompatibility = JavaVersion.VERSION_25
 }
 
-jar {
-	def projectName = project.name
-	inputs.property "projectName", projectName
-}
-
-publishing {
-	publications {
-		create("mavenJava", MavenPublication) {
-			from components.java
-		}
-	}
-	repositories {
-	}
-}
-
-// Dependency-free regression checks for audio boundaries and bounded buffering.
+// Dependency-free checks for logic that does not require a running Minecraft client.
 sourceSets {
-	recordingChecks {
+	checks {
 		java.srcDir 'src/check/java'
 		compileClasspath = sourceSets.main.output
 		runtimeClasspath = output + compileClasspath
 	}
 }
-tasks.register('recordingBufferTest', JavaExec) {
-	dependsOn recordingChecksClasses
-	classpath = sourceSets.recordingChecks.runtimeClasspath
-	mainClass = 'com.voiceinject.RecordingBufferTest'
-}
-tasks.named('check') {
-	dependsOn 'recordingBufferTest'
-}
-
 tasks.register('hotCommandsTest', JavaExec) {
-	dependsOn recordingChecksClasses
-	classpath = sourceSets.recordingChecks.runtimeClasspath
+	dependsOn checksClasses
+	classpath = sourceSets.checks.runtimeClasspath
 	mainClass = 'com.voiceinject.HotCommandsTest'
 }
+tasks.register('speechModelTest', JavaExec) {
+	dependsOn checksClasses
+	classpath = sourceSets.checks.runtimeClasspath
+	mainClass = 'com.voiceinject.SpeechModelTest'
+}
 tasks.named('check') {
-	dependsOn 'hotCommandsTest'
+	dependsOn 'hotCommandsTest', 'speechModelTest'
 }
