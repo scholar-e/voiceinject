@@ -82,7 +82,7 @@ public final class Main implements ClientModInitializer {
 
 		controller = new VoiceController(
 				config,
-				new MicrophoneCapture(),
+				new MicrophoneCapture(config),
 				new SpeechToText(),
 				new ChatInjector()
 		);
@@ -117,6 +117,7 @@ public final class Main implements ClientModInitializer {
 	public static final class Config {
 		public RecordingMode mode = RecordingMode.HOLD;
 		public List<String> hotCommands = List.of();
+		public String microphoneSource = "@DEFAULT_SOURCE@";
 		private static Path path() {
 			return FabricLoader.getInstance().getConfigDir().resolve("voiceinject.json");
 		}
@@ -126,6 +127,9 @@ public final class Main implements ClientModInitializer {
 				try {
 					JsonObject saved = JsonParser.parseString(Files.readString(path())).getAsJsonObject();
 					if (saved.has("mode")) result.mode = RecordingMode.valueOf(saved.get("mode").getAsString());
+					if (saved.has("microphoneSource") && saved.get("microphoneSource").isJsonPrimitive()) {
+						result.microphoneSource = saved.get("microphoneSource").getAsString();
+					}
 					List<String> commands = new ArrayList<>();
 					if (saved.has("hotCommands") && saved.get("hotCommands").isJsonArray()) {
 						for (JsonElement entry : saved.getAsJsonArray("hotCommands")) {
@@ -146,6 +150,7 @@ public final class Main implements ClientModInitializer {
 				try {
 					JsonObject saved = new JsonObject();
 					saved.addProperty("mode", mode.name());
+					saved.addProperty("microphoneSource", microphoneSource);
 					JsonArray commands = new JsonArray();
 					hotCommands.forEach(commands::add);
 					saved.add("hotCommands", commands);
@@ -169,7 +174,15 @@ public final class Main implements ClientModInitializer {
 		private Component modeLabel() {
 			return Component.translatable("voiceinject.mode", Component.translatable("voiceinject.mode." + settings.mode.name().toLowerCase(java.util.Locale.ROOT)));
 		}
+		private Component microphoneLabel() {
+			String source = settings.microphoneSource.equals("@DEFAULT_SOURCE@")
+					? Component.translatable("voiceinject.microphone.default").getString()
+					: settings.microphoneSource;
+			if (source.length() > 44) source = source.substring(0, 41) + "...";
+			return Component.translatable("voiceinject.microphone", source);
+		}
 		@Override protected void init() {
+			List<String> sources = MicrophoneCapture.availableSources();
 			addRenderableWidget(Button.builder(modeLabel(), button -> {
 				settings.mode = settings.mode == RecordingMode.HOLD ? RecordingMode.TAP : RecordingMode.HOLD;
 				saveFailed = !settings.save();
@@ -181,14 +194,20 @@ public final class Main implements ClientModInitializer {
 			addRenderableWidget(Button.builder(Component.translatable("voiceinject.hot.title"), button ->
 					minecraft.gui.setScreen(new HotCommandScreen(this, settings)))
 					.bounds(width / 2 - 100, height / 2 + 4, 200, 20).build());
+			addRenderableWidget(Button.builder(microphoneLabel(), button -> {
+				int current = sources.indexOf(settings.microphoneSource);
+				settings.microphoneSource = sources.get((current + 1) % sources.size());
+				saveFailed = !settings.save();
+				button.setMessage(microphoneLabel());
+			}).bounds(width / 2 - 100, height / 2 + 28, 200, 20).build());
 			addRenderableWidget(Button.builder(Component.translatable("gui.done"), button -> onClose())
-					.bounds(width / 2 - 100, height / 2 + 56, 200, 20).build());
+					.bounds(width / 2 - 100, height / 2 + 72, 200, 20).build());
 		}
 		@Override public void extractRenderState(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float partialTick) {
 			super.extractRenderState(graphics, mouseX, mouseY, partialTick);
 			graphics.centeredText(font, title, width / 2, height / 2 - 76, 0xFFFFFFFF);
-			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 32, 0xFFCCCCCC);
-			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 80, 0xFFFF5555);
+			graphics.centeredText(font, Component.translatable("voiceinject.settings.help"), width / 2, height / 2 + 52, 0xFFCCCCCC);
+			if (saveFailed) graphics.centeredText(font, Component.translatable("voiceinject.settings.save_failed"), width / 2, height / 2 + 96, 0xFFFF5555);
 		}
 		@Override public void onClose() { minecraft.gui.setScreen(parent); }
 		@Override public boolean isPauseScreen() { return false; }
@@ -290,37 +309,91 @@ public final class Main implements ClientModInitializer {
 		private static final int READ_CHUNK = 4096;
 		private static final long JOIN_TIMEOUT_MS = 500L;
 
+		private final Config config;
 		private final AtomicBoolean recording = new AtomicBoolean();
 		private final AtomicInteger session = new AtomicInteger();
 		private final ByteArrayOutputStream buffer = new ByteArrayOutputStream();
 		private volatile TargetDataLine line;
+		private volatile Process pulseProcess;
+		private volatile InputStream pulseStream;
 		private volatile Thread worker;
 		private volatile float sampleRate = 16000f;
 
 		public record AudioClip(byte[] pcm, float sampleRate) {}
+		public MicrophoneCapture(Config config) { this.config = config; }
 		public boolean isRecording() { return recording.get(); }
 		public void warmUp() { /* A line is opened only while actively recording. */ }
+		public static List<String> availableSources() {
+			List<String> sources = new ArrayList<>();
+			sources.add("@DEFAULT_SOURCE@");
+			if (!isLinux()) return sources;
+			try {
+				Process query = new ProcessBuilder("pactl", "list", "short", "sources").start();
+				try (var reader = query.inputReader()) {
+					reader.lines().map(line -> line.split("\\t"))
+							.filter(columns -> columns.length > 1 && !columns[1].endsWith(".monitor"))
+							.map(columns -> columns[1]).filter(source -> !sources.contains(source))
+							.forEach(sources::add);
+				}
+				query.waitFor();
+			} catch (IOException e) {
+				LOGGER.debug("PulseAudio source listing unavailable", e);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+			return List.copyOf(sources);
+		}
 		public boolean start() {
 			if (!recording.compareAndSet(false, true)) return false;
 			synchronized (buffer) {
 				buffer.reset();
 			}
-			TargetDataLine opened;
+			TargetDataLine opened = null;
+			InputStream input = null;
+			Process process = null;
 			try {
-				opened = openLine();
-				opened.start();
+				if (isLinux() && Files.isExecutable(Path.of("/usr/bin/parec"))) {
+					process = new ProcessBuilder("/usr/bin/parec",
+							"--device=" + config.microphoneSource,
+							"--client-name=voiceinject", "--stream-name=Minecraft voice recognition",
+							"--rate=16000", "--format=s16le", "--channels=1", "--raw")
+							.redirectError(ProcessBuilder.Redirect.DISCARD).start();
+					input = process.getInputStream();
+					sampleRate = 16000f;
+					LOGGER.info("Recording from PulseAudio source {}", config.microphoneSource);
+				} else {
+					opened = openLine();
+					opened.start();
+					sampleRate = opened.getFormat().getSampleRate();
+					LOGGER.info("Recording from Java Sound mixer {}", opened.getLineInfo());
+				}
 			} catch (LineUnavailableException | SecurityException e) {
 				recording.set(false);
 				LOGGER.error("Could not start microphone recording", e);
 				return false;
+			} catch (IOException e) {
+				LOGGER.warn("PulseAudio capture unavailable; falling back to Java Sound", e);
+				try {
+					opened = openLine();
+					opened.start();
+					sampleRate = opened.getFormat().getSampleRate();
+				} catch (LineUnavailableException fallbackError) {
+					recording.set(false);
+					LOGGER.error("Could not start fallback microphone recording", fallbackError);
+					return false;
+				}
 			}
 			int id;
 			synchronized (session) {
 				id = session.incrementAndGet();
 				line = opened;
-				sampleRate = opened.getFormat().getSampleRate();
+				pulseProcess = process;
+				pulseStream = input;
 			}
-			Thread capture = new Thread(() -> captureLoop(id, opened), "voiceinject-mic");
+			TargetDataLine captureLine = opened;
+			InputStream captureStream = input;
+			Process captureProcess = process;
+			Thread capture = new Thread(() -> captureLoop(id, captureLine, captureStream, captureProcess), "voiceinject-mic");
 			capture.setDaemon(true);
 			worker = capture;
 			capture.start();
@@ -332,7 +405,13 @@ public final class Main implements ClientModInitializer {
 				return CompletableFuture.completedFuture(new AudioClip(new byte[0], sampleRate));
 			}
 			TargetDataLine current = line;
+			InputStream currentStream = pulseStream;
+			Process currentProcess = pulseProcess;
 			if (current != null) closeQuietly(current);
+			if (currentProcess != null) currentProcess.destroy();
+			if (currentStream != null) {
+				try { currentStream.close(); } catch (IOException ignored) {}
+			}
 			Thread capture = worker;
 			if (capture != null && capture != Thread.currentThread()) {
 				try {
@@ -345,6 +424,8 @@ public final class Main implements ClientModInitializer {
 			synchronized (session) {
 				session.incrementAndGet();
 				if (line == current) line = null;
+				if (pulseStream == currentStream) pulseStream = null;
+				if (pulseProcess == currentProcess) pulseProcess = null;
 			}
 			byte[] pcm;
 			synchronized (buffer) { pcm = buffer.toByteArray(); }
@@ -358,24 +439,28 @@ public final class Main implements ClientModInitializer {
 		}
 		public void close() { discard(); }
 
-		private void captureLoop(int id, TargetDataLine opened) {
+		private void captureLoop(int id, TargetDataLine opened, InputStream input, Process process) {
 			try {
 				int maximum = (int) sampleRate * 2 * MAX_SECONDS;
 				byte[] chunk = new byte[READ_CHUNK];
 				while (recording.get() && session.get() == id) {
-					int count = opened.read(chunk, 0, chunk.length);
+					int count = input != null ? input.read(chunk) : opened.read(chunk, 0, chunk.length);
 					if (count <= 0) break;
 					synchronized (buffer) {
 						if (session.get() != id || buffer.size() >= maximum) break;
 						buffer.write(chunk, 0, Math.min(count, maximum - buffer.size()));
 					}
 				}
-			} catch (RuntimeException e) {
+			} catch (IOException | RuntimeException e) {
 				if (recording.get()) LOGGER.error("Microphone capture failed", e);
 			} finally {
 				if (opened != null) closeQuietly(opened);
+				if (input != null) try { input.close(); } catch (IOException ignored) {}
+				if (process != null) process.destroyForcibly();
 				synchronized (session) {
 					if (line == opened) line = null;
+					if (pulseStream == input) pulseStream = null;
+					if (pulseProcess == process) pulseProcess = null;
 				}
 			}
 		}
@@ -400,6 +485,10 @@ public final class Main implements ClientModInitializer {
 			try { current.stop(); } catch (RuntimeException ignored) {}
 			try { current.flush(); } catch (RuntimeException ignored) {}
 			try { current.close(); } catch (RuntimeException ignored) {}
+		}
+
+		private static boolean isLinux() {
+			return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("linux");
 		}
 	}
 

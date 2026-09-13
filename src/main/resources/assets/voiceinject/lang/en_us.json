@@ -8,6 +8,8 @@
 	"key.voiceinject.open_config": "VoiceInject settings",
 	"voiceinject.settings": "VoiceInject settings",
 	"voiceinject.keybinds": "Configure keybinds",
+	"voiceinject.microphone": "Microphone: %s",
+	"voiceinject.microphone.default": "System default",
 	"voiceinject.mode": "Recording mode: %s",
 	"voiceinject.mode.hold": "Hold",
 	"voiceinject.mode.tap": "Tap",
