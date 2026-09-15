@@ -19,6 +19,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
@@ -316,9 +317,8 @@ public final class Main implements ClientModInitializer {
 		}
 	}
 
-	/** Captures PCM from a fresh microphone line for each recording. */
+	/** Captures PCM from a fresh microphone stream for each recording. */
 	public static final class MicrophoneCapture {
-		private static final float[] SAMPLE_RATES = {16000f, 48000f, 44100f};
 		private static final int MAX_SECONDS = 30;
 		private static final int READ_CHUNK = 4096;
 		private static final long JOIN_TIMEOUT_MS = 500L;
@@ -336,7 +336,7 @@ public final class Main implements ClientModInitializer {
 		public record AudioClip(byte[] pcm, float sampleRate) {}
 		public MicrophoneCapture(Config config) { this.config = config; }
 		public boolean isRecording() { return recording.get(); }
-		public void warmUp() { /* A line is opened only while actively recording. */ }
+		public void warmUp() { /* The stream is opened only while recording. */ }
 		public static List<String> availableSources() {
 			List<String> sources = new ArrayList<>();
 			sources.add("@DEFAULT_SOURCE@");
@@ -366,36 +366,45 @@ public final class Main implements ClientModInitializer {
 			InputStream input = null;
 			Process process = null;
 			try {
-				if (isLinux() && Files.isExecutable(Path.of("/usr/bin/parec"))) {
-					process = new ProcessBuilder("/usr/bin/parec",
-							"--device=" + config.microphoneSource,
-							"--client-name=voiceinject", "--stream-name=Minecraft voice recognition",
-							"--rate=16000", "--format=s16le", "--channels=1", "--raw")
-							.redirectError(ProcessBuilder.Redirect.DISCARD).start();
-					input = process.getInputStream();
-					sampleRate = 16000f;
-					LOGGER.info("Recording from PulseAudio source {}", config.microphoneSource);
+				if (isLinux()) {
+					try {
+						String source = usablePulseSource();
+						process = new ProcessBuilder("parec",
+								"--device=" + source,
+								"--client-name=voiceinject", "--stream-name=Minecraft voice recognition",
+								"--rate=16000", "--format=s16le", "--channels=1", "--raw")
+								.redirectError(ProcessBuilder.Redirect.DISCARD).start();
+						input = process.getInputStream();
+						if (process.waitFor(100, TimeUnit.MILLISECONDS)) {
+							throw new IOException("parec exited immediately with status " + process.exitValue());
+						}
+						sampleRate = 16000f;
+						LOGGER.info("Recording with PulseAudio/PipeWire source {}", source);
+					} catch (IOException e) {
+						LOGGER.warn("parec is unavailable; falling back to Java Sound: {}", e.toString());
+						if (input != null) try { input.close(); } catch (IOException ignored) {}
+						if (process != null) process.destroyForcibly();
+						input = null;
+						process = null;
+						opened = openLine();
+						opened.start();
+						sampleRate = opened.getFormat().getSampleRate();
+					}
 				} else {
 					opened = openLine();
 					opened.start();
 					sampleRate = opened.getFormat().getSampleRate();
-					LOGGER.info("Recording from Java Sound mixer {}", opened.getLineInfo());
 				}
 			} catch (LineUnavailableException | SecurityException e) {
 				recording.set(false);
+				if (process != null) process.destroyForcibly();
 				LOGGER.error("Could not start microphone recording", e);
 				return false;
-			} catch (IOException e) {
-				LOGGER.warn("PulseAudio capture unavailable; falling back to Java Sound", e);
-				try {
-					opened = openLine();
-					opened.start();
-					sampleRate = opened.getFormat().getSampleRate();
-				} catch (LineUnavailableException fallbackError) {
-					recording.set(false);
-					LOGGER.error("Could not start fallback microphone recording", fallbackError);
-					return false;
-				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+				recording.set(false);
+				if (process != null) process.destroyForcibly();
+				return false;
 			}
 			int id;
 			synchronized (session) {
@@ -418,32 +427,27 @@ public final class Main implements ClientModInitializer {
 			if (!recording.compareAndSet(true, false)) {
 				return CompletableFuture.completedFuture(new AudioClip(new byte[0], sampleRate));
 			}
-			TargetDataLine current = line;
+			TargetDataLine currentLine = line;
 			InputStream currentStream = pulseStream;
 			Process currentProcess = pulseProcess;
-			if (current != null) closeQuietly(current);
+			if (currentLine != null) closeQuietly(currentLine);
 			if (currentProcess != null) currentProcess.destroy();
-			if (currentStream != null) {
-				try { currentStream.close(); } catch (IOException ignored) {}
+			if (currentStream != null) try { currentStream.close(); } catch (IOException ignored) {}
+			Thread currentWorker = worker;
+			if (currentWorker != null && currentWorker != Thread.currentThread()) {
+				try { currentWorker.join(JOIN_TIMEOUT_MS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
 			}
-			Thread capture = worker;
-			if (capture != null && capture != Thread.currentThread()) {
-				try {
-					capture.join(JOIN_TIMEOUT_MS);
-				} catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-				}
-			}
-			worker = null;
 			synchronized (session) {
 				session.incrementAndGet();
-				if (line == current) line = null;
+				if (line == currentLine) line = null;
 				if (pulseStream == currentStream) pulseStream = null;
 				if (pulseProcess == currentProcess) pulseProcess = null;
 			}
+			worker = null;
 			byte[] pcm;
 			synchronized (buffer) { pcm = buffer.toByteArray(); }
-			LOGGER.info("Microphone recording stopped ({} bytes at {} Hz)", pcm.length, (int) sampleRate);
+			LOGGER.info("Microphone recording stopped ({} bytes at {} Hz, peak {})",
+					pcm.length, (int) sampleRate, peakAmplitude(pcm));
 			return CompletableFuture.completedFuture(new AudioClip(pcm, sampleRate));
 		}
 		public boolean hasCompletedRecording() { return false; }
@@ -471,12 +475,26 @@ public final class Main implements ClientModInitializer {
 				if (opened != null) closeQuietly(opened);
 				if (input != null) try { input.close(); } catch (IOException ignored) {}
 				if (process != null) process.destroyForcibly();
-				synchronized (session) {
-					if (line == opened) line = null;
-					if (pulseStream == input) pulseStream = null;
-					if (pulseProcess == process) pulseProcess = null;
-				}
 			}
+		}
+
+		private String usablePulseSource() {
+			String requested = config.microphoneSource;
+			if (requested == null || requested.isBlank() || requested.equals("@DEFAULT_SOURCE@")) {
+				return "@DEFAULT_SOURCE@";
+			}
+			if (availableSources().contains(requested)) return requested;
+			LOGGER.warn("Saved microphone source '{}' is unavailable on this computer; using the system default", requested);
+			return "@DEFAULT_SOURCE@";
+		}
+
+		private static int peakAmplitude(byte[] pcm) {
+			int peak = 0;
+			for (int i = 0; i + 1 < pcm.length; i += 2) {
+				int sample = Math.abs((short) ((pcm[i] & 0xff) | (pcm[i + 1] << 8)));
+				if (sample > peak) peak = sample;
+			}
+			return peak;
 		}
 		private static TargetDataLine openLine() throws LineUnavailableException {
 			for (float rate : new float[] {16000f, 48000f, 44100f}) {
@@ -523,8 +541,8 @@ public final class Main implements ClientModInitializer {
 		});
 		private final Set<SpeechModel> downloading = ConcurrentHashMap.newKeySet();
 
-		private Model model;
-		private SpeechModel loadedModel;
+		private volatile Model model;
+		private volatile SpeechModel loadedModel;
 
 		public SpeechToText(Config config) {
 			this.config = config;
@@ -582,7 +600,11 @@ public final class Main implements ClientModInitializer {
 					recognizer.setMaxAlternatives(10);
 					recognizer.acceptWaveForm(sixteenKhz, sixteenKhz.length);
 					List<String> text = extractAlternatives(recognizer.getFinalResult());
-					LOGGER.info("Vosk returned {} alternative(s): {}", text.size(), text);
+					if (text.isEmpty()) {
+						LOGGER.info("No speech detected");
+					} else {
+						LOGGER.info("Speech detected: {}", text);
+					}
 					return text;
 				}
 			} catch (Exception t) {
@@ -603,9 +625,19 @@ public final class Main implements ClientModInitializer {
 			LOGGER.info("Loading {} Vosk model from {}", selected, modelDir);
 			Model replacement = new Model(modelDir.toString());
 			Model previous = model;
-			model = replacement;
+			model = null;
+			loadedModel = null;
+			if (previous != null) {
+				try {
+					previous.close();
+				} catch (RuntimeException e) {
+					LOGGER.warn("Could not close previous Vosk model", e);
+				}
+			}
+			LOGGER.info("Loading {} Vosk model from {}", selected, modelDir);
+			model = new Model(modelDir.toString());
 			loadedModel = selected;
-			if (previous != null) previous.close();
+			LOGGER.info("Vosk model loaded: {}", selected);
 			return model;
 		}
 
