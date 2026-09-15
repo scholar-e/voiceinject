@@ -10,18 +10,17 @@ import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-
-
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -72,23 +71,6 @@ import net.minecraft.resources.Identifier;
 public final class Main implements ClientModInitializer {
 	public static final String MOD_ID = "voiceinject";
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
-
-	// #region agent log
-	private static void debugLog(String hypothesisId, String location, String message, JsonObject data) {
-		try {
-			JsonObject payload = new JsonObject();
-			payload.addProperty("sessionId", "b37fd5");
-			payload.addProperty("runId", "pre-fix");
-			payload.addProperty("hypothesisId", hypothesisId);
-			payload.addProperty("location", location);
-			payload.addProperty("message", message);
-			payload.add("data", data == null ? new JsonObject() : data);
-			payload.addProperty("timestamp", System.currentTimeMillis());
-			Files.writeString(Path.of("C:\\Users\\lpanh\\.cursor\\projects\\voiceinject\\debug-b37fd5.log"),
-					payload + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-		} catch (Exception ignored) {}
-	}
-	// #endregion
 
 	private static Config config;
 	private static VoiceController controller;
@@ -215,14 +197,8 @@ public final class Main implements ClientModInitializer {
 				button.setMessage(modeLabel());
 			}).bounds(width / 2 - 100, height / 2 - 56, 200, 20).build());
 			addRenderableWidget(Button.builder(modelLabel(), button -> {
-				SpeechModel previous = settings.speechModel;
 				settings.speechModel = settings.speechModel.next();
-				// #region agent log
-				JsonObject cycle = new JsonObject();
-				cycle.addProperty("from", previous.name());
-				cycle.addProperty("to", settings.speechModel.name());
-				debugLog("H4", "Main.java:ConfigScreen.modelButton", "cycled speech model", cycle);
-				// #endregion
+				controller.speechToText.prepare(settings.speechModel);
 				saveFailed = !settings.save();
 				button.setMessage(modelLabel());
 			}).bounds(width / 2 - 100, height / 2 - 32, 200, 20).build());
@@ -540,36 +516,60 @@ public final class Main implements ClientModInitializer {
 			thread.setDaemon(true);
 			return thread;
 		});
+		private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor(runnable -> {
+			Thread thread = new Thread(runnable, "voiceinject-model-download");
+			thread.setDaemon(true);
+			return thread;
+		});
+		private final Set<SpeechModel> downloading = ConcurrentHashMap.newKeySet();
 
 		private Model model;
 		private SpeechModel loadedModel;
 
-		public SpeechToText(Config config) { this.config = config; }
+		public SpeechToText(Config config) {
+			this.config = config;
+			prepare(config.speechModel);
+		}
+
+		static final class ModelUnavailableException extends Exception {
+			final SpeechModel speechModel;
+			ModelUnavailableException(SpeechModel speechModel) {
+				super("Recognition model is still downloading: " + speechModel);
+				this.speechModel = speechModel;
+			}
+		}
+
+		void prepare(SpeechModel selected) {
+			if (modelReady(selected) || !downloading.add(selected)) {
+				return;
+			}
+			downloadExecutor.execute(() -> {
+				try {
+					ensureModelOnDisk(selected);
+					LOGGER.info("Downloaded {} Vosk model", selected);
+				} catch (Exception e) {
+					LOGGER.error("Could not download {} Vosk model", selected, e);
+				} finally {
+					downloading.remove(selected);
+				}
+			});
+		}
+
+		private boolean modelReady(SpeechModel selected) {
+			return isModelReady(FabricLoader.getInstance().getConfigDir().resolve("voiceinject").resolve(selected.directory()));
+		}
 
 		public CompletableFuture<List<String>> transcribe(byte[] pcm, float sampleRate) {
-			long submittedAt = System.currentTimeMillis();
-			return CompletableFuture.supplyAsync(() -> {
-				// #region agent log
-				JsonObject queued = new JsonObject();
-				queued.addProperty("queueWaitMs", System.currentTimeMillis() - submittedAt);
-				queued.addProperty("pcmBytes", pcm.length);
-				queued.addProperty("sampleRate", sampleRate);
-				queued.addProperty("selected", String.valueOf(config.speechModel));
-				queued.addProperty("loadedModel", String.valueOf(loadedModel));
-				debugLog("H3", "Main.java:SpeechToText.transcribe", "stt executor started job", queued);
-				// #endregion
-				return transcribeBlocking(pcm, sampleRate);
-			}, executor);
+			SpeechModel selected = config.speechModel;
+			if (!modelReady(selected)) {
+				prepare(selected);
+				return CompletableFuture.failedFuture(new ModelUnavailableException(selected));
+			}
+			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm, sampleRate), executor);
 		}
 
 		private List<String> transcribeBlocking(byte[] pcm, float sampleRate) {
 			if (pcm.length == 0) {
-				// #region agent log
-				JsonObject emptyPcm = new JsonObject();
-				emptyPcm.addProperty("selected", String.valueOf(config.speechModel));
-				emptyPcm.addProperty("loadedModel", String.valueOf(loadedModel));
-				debugLog("H2", "Main.java:SpeechToText.transcribeBlocking", "empty pcm short-circuit", emptyPcm);
-				// #endregion
 				return List.of();
 			}
 			try {
@@ -581,89 +581,31 @@ public final class Main implements ClientModInitializer {
 				try (Recognizer recognizer = new Recognizer(loaded, TARGET_RATE)) {
 					recognizer.setMaxAlternatives(10);
 					recognizer.acceptWaveForm(sixteenKhz, sixteenKhz.length);
-					String raw = recognizer.getFinalResult();
-					List<String> text = extractAlternatives(raw);
+					List<String> text = extractAlternatives(recognizer.getFinalResult());
 					LOGGER.info("Vosk returned {} alternative(s): {}", text.size(), text);
-					// #region agent log
-					JsonObject result = new JsonObject();
-					result.addProperty("selected", String.valueOf(config.speechModel));
-					result.addProperty("loadedModel", String.valueOf(loadedModel));
-					result.addProperty("pcmBytes", pcm.length);
-					result.addProperty("sixteenKhzBytes", sixteenKhz.length);
-					result.addProperty("altCount", text.size());
-					result.addProperty("raw", raw == null ? "null" : raw.substring(0, Math.min(raw.length(), 400)));
-					debugLog("H2", "Main.java:SpeechToText.transcribeBlocking", "vosk final result", result);
-					// #endregion
 					return text;
 				}
 			} catch (Exception t) {
-				// #region agent log
-				JsonObject failed = new JsonObject();
-				failed.addProperty("selected", String.valueOf(config.speechModel));
-				failed.addProperty("loadedModel", String.valueOf(loadedModel));
-				failed.addProperty("errorType", t.getClass().getName());
-				failed.addProperty("errorMessage", String.valueOf(t.getMessage()));
-				debugLog("H5", "Main.java:SpeechToText.transcribeBlocking", "transcribe exception", failed);
-				// #endregion
 				throw new java.util.concurrent.CompletionException(t);
-			} catch (Throwable t) {
-				// #region agent log
-				JsonObject crashed = new JsonObject();
-				crashed.addProperty("selected", String.valueOf(config.speechModel));
-				crashed.addProperty("loadedModel", String.valueOf(loadedModel));
-				crashed.addProperty("errorType", t.getClass().getName());
-				crashed.addProperty("errorMessage", String.valueOf(t.getMessage()));
-				debugLog("H5", "Main.java:SpeechToText.transcribeBlocking", "transcribe throwable", crashed);
-				// #endregion
-				throw t;
 			}
 		}
 
-		private Model ensureModel(SpeechModel selected) throws IOException, InterruptedException {
+		private Model ensureModel(SpeechModel selected) throws IOException, ModelUnavailableException {
 			if (model != null && loadedModel == selected) {
-				// #region agent log
-				JsonObject hit = new JsonObject();
-				hit.addProperty("selected", selected.name());
-				hit.addProperty("cacheHit", true);
-				debugLog("H1", "Main.java:SpeechToText.ensureModel", "reusing loaded vosk model", hit);
-				// #endregion
 				return model;
 			}
+			if (!modelReady(selected)) {
+				prepare(selected);
+				throw new ModelUnavailableException(selected);
+			}
 			LibVosk.setLogLevel(LogLevel.WARNINGS);
-			Path modelDir = ensureModelOnDisk(selected);
+			Path modelDir = FabricLoader.getInstance().getConfigDir().resolve("voiceinject").resolve(selected.directory());
 			LOGGER.info("Loading {} Vosk model from {}", selected, modelDir);
-			Path conf = modelDir.resolve("conf").resolve("model.conf");
-			Path am = modelDir.resolve("am").resolve("final.mdl");
-			Runtime rt = Runtime.getRuntime();
-			// #region agent log
-			JsonObject before = new JsonObject();
-			before.addProperty("selected", selected.name());
-			before.addProperty("loadedModelBefore", String.valueOf(loadedModel));
-			before.addProperty("hadPrevious", model != null);
-			before.addProperty("modelDir", modelDir.toString());
-			before.addProperty("ready", isModelReady(modelDir));
-			before.addProperty("confBytes", Files.isRegularFile(conf) ? Files.size(conf) : -1);
-			before.addProperty("amBytes", Files.isRegularFile(am) ? Files.size(am) : -1);
-			before.addProperty("maxMem", rt.maxMemory());
-			before.addProperty("totalMem", rt.totalMemory());
-			before.addProperty("freeMem", rt.freeMemory());
-			debugLog("H1", "Main.java:SpeechToText.ensureModel", "loading vosk model", before);
-			// #endregion
-			long started = System.currentTimeMillis();
 			Model replacement = new Model(modelDir.toString());
 			Model previous = model;
 			model = replacement;
 			loadedModel = selected;
 			if (previous != null) previous.close();
-			// #region agent log
-			JsonObject after = new JsonObject();
-			after.addProperty("selected", selected.name());
-			after.addProperty("closedPrevious", previous != null);
-			after.addProperty("loadMs", System.currentTimeMillis() - started);
-			after.addProperty("freeMemAfter", rt.freeMemory());
-			after.addProperty("totalMemAfter", rt.totalMemory());
-			debugLog("H1", "Main.java:SpeechToText.ensureModel", "loaded vosk model", after);
-			// #endregion
 			return model;
 		}
 
@@ -1012,26 +954,18 @@ public final class Main implements ClientModInitializer {
 			String command = selectedCommand();
 			client.gui.hud.setOverlayMessage(Component.translatable("voiceinject.transcribing"), false);
 			captured.thenCompose(clip -> speechToText.transcribe(clip.pcm(), clip.sampleRate())).whenComplete((text, error) -> client.execute(() -> {
-				boolean stale = requestSession != session || requestTranscription != transcription || client.player == null;
-				// #region agent log
-				JsonObject done = new JsonObject();
-				done.addProperty("stale", stale);
-				done.addProperty("requestSession", requestSession);
-				done.addProperty("session", session);
-				done.addProperty("requestTranscription", requestTranscription);
-				done.addProperty("transcription", transcription);
-				done.addProperty("playerNull", client.player == null);
-				done.addProperty("selected", String.valueOf(config.speechModel));
-				done.addProperty("hasError", error != null);
-				done.addProperty("errorType", error == null ? "" : error.getClass().getName());
-				done.addProperty("errorMessage", error == null ? "" : String.valueOf(error.getMessage()));
-				done.addProperty("textCount", text == null ? -1 : text.size());
-				debugLog("H4", "Main.java:VoiceController.finishSession", "transcription callback", done);
-				// #endregion
-				if (stale) return;
+				if (requestSession != session || requestTranscription != transcription || client.player == null) return;
 				drainClicks();
 				microphone.discard();
 				if (error != null) {
+					Throwable cause = error instanceof java.util.concurrent.CompletionException && error.getCause() != null
+							? error.getCause() : error;
+					if (cause instanceof SpeechToText.ModelUnavailableException unavailable) {
+						showStatus(client, Component.translatable("voiceinject.model_downloading",
+								Component.translatable("voiceinject.model." + unavailable.speechModel.name().toLowerCase(java.util.Locale.ROOT)),
+								unavailable.speechModel.downloadSize()));
+						return;
+					}
 					LOGGER.error("Speech-to-text failed", error);
 					showStatus(client, Component.translatable("voiceinject.failed"));
 					return;
