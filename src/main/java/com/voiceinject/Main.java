@@ -14,14 +14,14 @@ import java.time.Duration;
 import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-
-
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
@@ -199,6 +199,7 @@ public final class Main implements ClientModInitializer {
 			}).bounds(width / 2 - 100, height / 2 - 56, 200, 20).build());
 			addRenderableWidget(Button.builder(modelLabel(), button -> {
 				settings.speechModel = settings.speechModel.next();
+				controller.speechToText.prepare(settings.speechModel);
 				saveFailed = !settings.save();
 				button.setMessage(modelLabel());
 			}).bounds(width / 2 - 100, height / 2 - 32, 200, 20).build());
@@ -533,13 +534,55 @@ public final class Main implements ClientModInitializer {
 			thread.setDaemon(true);
 			return thread;
 		});
+		private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor(runnable -> {
+			Thread thread = new Thread(runnable, "voiceinject-model-download");
+			thread.setDaemon(true);
+			return thread;
+		});
+		private final Set<SpeechModel> downloading = ConcurrentHashMap.newKeySet();
 
 		private volatile Model model;
 		private volatile SpeechModel loadedModel;
 
-		public SpeechToText(Config config) { this.config = config; }
+		public SpeechToText(Config config) {
+			this.config = config;
+			prepare(config.speechModel);
+		}
+
+		static final class ModelUnavailableException extends Exception {
+			final SpeechModel speechModel;
+			ModelUnavailableException(SpeechModel speechModel) {
+				super("Recognition model is still downloading: " + speechModel);
+				this.speechModel = speechModel;
+			}
+		}
+
+		void prepare(SpeechModel selected) {
+			if (modelReady(selected) || !downloading.add(selected)) {
+				return;
+			}
+			downloadExecutor.execute(() -> {
+				try {
+					ensureModelOnDisk(selected);
+					LOGGER.info("Downloaded {} Vosk model", selected);
+				} catch (Exception e) {
+					LOGGER.error("Could not download {} Vosk model", selected, e);
+				} finally {
+					downloading.remove(selected);
+				}
+			});
+		}
+
+		private boolean modelReady(SpeechModel selected) {
+			return isModelReady(FabricLoader.getInstance().getConfigDir().resolve("voiceinject").resolve(selected.directory()));
+		}
 
 		public CompletableFuture<List<String>> transcribe(byte[] pcm, float sampleRate) {
+			SpeechModel selected = config.speechModel;
+			if (!modelReady(selected)) {
+				prepare(selected);
+				return CompletableFuture.failedFuture(new ModelUnavailableException(selected));
+			}
 			return CompletableFuture.supplyAsync(() -> transcribeBlocking(pcm, sampleRate), executor);
 		}
 
@@ -569,16 +612,18 @@ public final class Main implements ClientModInitializer {
 			}
 		}
 
-		private Model ensureModel(SpeechModel selected) throws IOException, InterruptedException {
+		private Model ensureModel(SpeechModel selected) throws IOException, ModelUnavailableException {
 			if (model != null && loadedModel == selected) {
 				return model;
 			}
+			if (!modelReady(selected)) {
+				prepare(selected);
+				throw new ModelUnavailableException(selected);
+			}
 			LibVosk.setLogLevel(LogLevel.WARNINGS);
-			Path modelDir = ensureModelOnDisk(selected);
-			// Release the previous model before loading the replacement. Loading a new
-			// model while the 1.8 GB one is still resident doubles the peak memory and
-			// can exhaust native memory, which left the other models unusable after a
-			// switch back from FULL.
+			Path modelDir = FabricLoader.getInstance().getConfigDir().resolve("voiceinject").resolve(selected.directory());
+			LOGGER.info("Loading {} Vosk model from {}", selected, modelDir);
+			Model replacement = new Model(modelDir.toString());
 			Model previous = model;
 			model = null;
 			loadedModel = null;
@@ -945,6 +990,14 @@ public final class Main implements ClientModInitializer {
 				drainClicks();
 				microphone.discard();
 				if (error != null) {
+					Throwable cause = error instanceof java.util.concurrent.CompletionException && error.getCause() != null
+							? error.getCause() : error;
+					if (cause instanceof SpeechToText.ModelUnavailableException unavailable) {
+						showStatus(client, Component.translatable("voiceinject.model_downloading",
+								Component.translatable("voiceinject.model." + unavailable.speechModel.name().toLowerCase(java.util.Locale.ROOT)),
+								unavailable.speechModel.downloadSize()));
+						return;
+					}
 					LOGGER.error("Speech-to-text failed", error);
 					showStatus(client, Component.translatable("voiceinject.failed"));
 					return;
