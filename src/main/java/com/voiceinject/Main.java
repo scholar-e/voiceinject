@@ -1,6 +1,8 @@
 /*Todo:
 -Add group messaging capability
 -Add toggle for either no model selected or turning off STT completely
+-Remove system chat messages from predictive text suggestions - clogs chat box
+-Branch for 1.21.11
 */
 package com.voiceinject;
 
