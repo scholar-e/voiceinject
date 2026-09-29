@@ -1,3 +1,7 @@
+/*Todo:
+-Add group messaging capability
+-Add e2e RSA encryption for /msgs with designated user that has mod installed
+*/
 package com.voiceinject;
 
 import java.io.ByteArrayOutputStream;
