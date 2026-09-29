@@ -1,6 +1,6 @@
 /*Todo:
 -Add group messaging capability
--Add e2e RSA encryption for /msgs with designated user that has mod installed
+-Add toggle for either no model selected or turning off STT completely
 */
 package com.voiceinject;
 
